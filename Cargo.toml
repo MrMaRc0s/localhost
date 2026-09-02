@@ -1,0 +1,16 @@
+[package]
+name = "localhost"
+version = "0.1.0"
+edition = "2021"
+authors = ["cmarkos"]
+description = "A single-threaded, epoll-driven HTTP/1.1 server written from scratch in Rust."
+
+[[bin]]
+name = "localhost"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "unwind"
