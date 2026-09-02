@@ -50,7 +50,52 @@ pub fn dispatch(server: &ServerConfig, req: &Request) -> Dispatch {
         None => return Dispatch::Response(super::error_page::build(Some(server), 403)),
     };
 
+    // DELETE never falls through to directory-index / autoindex handling —
+    // it either removes the exact resource named or it doesn't.
+    if req.method == Method::Delete {
+        return resolve_delete(server, &fs_path);
+    }
+
+    // A POST that lands on an existing CGI script still needs to run
+    // through the CGI path below; otherwise treat it as a file upload.
+    if req.method == Method::Post && !matches_cgi_script(route, &fs_path) {
+        return resolve_upload(server, route, base_dir, &remainder, req);
+    }
+
     resolve_path(server, route, &fs_path, &remainder, req)
+}
+
+fn matches_cgi_script(route: &RouteConfig, fs_path: &Path) -> bool {
+    fs_path.is_file()
+        && fs_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|ext| route.cgi.contains_key(&format!(".{}", ext)))
+            .unwrap_or(false)
+}
+
+fn resolve_delete(server: &ServerConfig, fs_path: &Path) -> Dispatch {
+    use crate::upload::DeleteOutcome;
+    let resp = match crate::upload::delete(fs_path) {
+        DeleteOutcome::Deleted => Response::no_content(204),
+        DeleteOutcome::NotFound => super::error_page::build(Some(server), 404),
+        DeleteOutcome::Forbidden => super::error_page::build(Some(server), 403),
+        DeleteOutcome::Error(_) => super::error_page::build(Some(server), 500),
+    };
+    Dispatch::Response(resp)
+}
+
+fn resolve_upload(server: &ServerConfig, route: &RouteConfig, base_dir: &str, remainder: &str, req: &Request) -> Dispatch {
+    let store_dir = route.upload_store.as_deref().unwrap_or(base_dir);
+    let resp = match crate::upload::save(store_dir, remainder, req) {
+        Ok(saved) => {
+            let list = saved.join(", ");
+            Response::html(201, format!("<p>Uploaded: {}</p>", html_escape(&list)))
+                .header("Location", req.path.clone())
+        }
+        Err(_) => super::error_page::build(Some(server), 400),
+    };
+    Dispatch::Response(resp)
 }
 
 /// The portion of the request path beyond the matched route's prefix,

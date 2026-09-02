@@ -4,6 +4,7 @@ mod fs_util;
 mod http;
 mod router;
 mod server;
+mod upload;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
