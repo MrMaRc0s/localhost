@@ -18,10 +18,14 @@ fn main() {
     };
 
     println!(
-        "localhost: parsed `{}` — {} server block(s), {} listener(s)",
+        "localhost: parsed `{}` — {} server block(s), {} listener(s) requested",
         config_path,
         cfg.servers.len(),
         cfg.all_listens().len()
     );
-    println!("localhost: server loop not implemented yet");
+
+    if let Err(e) = server::run(cfg) {
+        eprintln!("localhost: fatal: {}", e);
+        std::process::exit(1);
+    }
 }
