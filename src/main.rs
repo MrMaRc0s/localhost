@@ -2,6 +2,7 @@ mod config;
 mod error_page;
 mod fs_util;
 mod http;
+mod server;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
