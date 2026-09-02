@@ -43,6 +43,10 @@ pub struct Connection {
     /// (static or CGI-produced) is actually ready to write.
     pending_keep_alive: bool,
     pending_for_head: bool,
+    /// Set when this request minted a brand new session; consumed by the
+    /// next `begin_write` regardless of whether the response came from a
+    /// static handler or a CGI script.
+    pending_set_cookie: Option<String>,
 }
 
 impl Connection {
@@ -58,6 +62,7 @@ impl Connection {
             last_activity: Instant::now(),
             pending_keep_alive: false,
             pending_for_head: false,
+            pending_set_cookie: None,
         }
     }
 
@@ -265,18 +270,39 @@ impl Connection {
             }
         };
 
+        // Every request carries (or is issued) a session, regardless of
+        // which route ends up handling it: look one up from the Cookie
+        // header, or mint a fresh one — in which case the response, once
+        // it exists, gets a Set-Cookie attached in begin_write.
+        let existing = req
+            .header("cookie")
+            .and_then(|h| crate::session::extract_cookie(h, crate::session::COOKIE_NAME));
+        let (session_id, is_new) = ctx.sessions.touch(existing.as_deref());
+        if is_new {
+            self.pending_set_cookie = Some(format!("{}={}; Path=/; HttpOnly; SameSite=Lax", crate::session::COOKIE_NAME, session_id));
+        }
+        let visits = ctx.sessions.increment_visit_count(&session_id);
+
         match crate::router::dispatch(server, &req) {
             Dispatch::Response(r) => self.begin_write(r, keep_alive, for_head, ctx.epoll),
             Dispatch::Cgi(cgi_req) => {
                 self.pending_keep_alive = keep_alive;
                 self.pending_for_head = for_head;
-                self.start_cgi(cgi_req, &req, server, ctx);
+                self.start_cgi(cgi_req, &req, server, &session_id, visits, ctx);
             }
         }
     }
 
-    fn start_cgi(&mut self, cgi_req: crate::router::CgiRequest, req: &Request, server: &crate::config::ServerConfig, ctx: &mut EventCtx) {
-        match cgi::spawn(&cgi_req, req, server, self.listen, &self.peer_addr) {
+    fn start_cgi(
+        &mut self,
+        cgi_req: crate::router::CgiRequest,
+        req: &Request,
+        server: &crate::config::ServerConfig,
+        session_id: &str,
+        session_visits: u64,
+        ctx: &mut EventCtx,
+    ) {
+        match cgi::spawn(&cgi_req, req, server, self.listen, &self.peer_addr, session_id, session_visits) {
             Ok(process) => {
                 if let Some(stdin_fd) = process.stdin_fd() {
                     if ctx.epoll.add(stdin_fd, epoll::WRITABLE).is_ok() {
@@ -342,6 +368,10 @@ impl Connection {
     }
 
     fn begin_write(&mut self, response: Response, keep_alive: bool, for_head: bool, epoll: &Epoll) {
+        let response = match self.pending_set_cookie.take() {
+            Some(cookie) => response.header("Set-Cookie", cookie),
+            None => response,
+        };
         let buf = response.serialize(keep_alive, for_head);
         self.state = State::Writing { buf, written: 0, close_after: !keep_alive };
         let _ = epoll.modify(self.fd, epoll::WRITABLE);

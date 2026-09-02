@@ -9,6 +9,7 @@ use std::process::Child;
 use std::time::Instant;
 
 use crate::config::{Config, Listen};
+use crate::session::SessionStore;
 use connection::Connection;
 use epoll::Epoll;
 
@@ -29,6 +30,7 @@ pub struct EventCtx<'a> {
     pub epoll: &'a Epoll,
     pub pipes: &'a mut HashMap<RawFd, RawFd>,
     pub reap: &'a mut Vec<Child>,
+    pub sessions: &'a mut SessionStore,
 }
 
 pub fn run(config: Config) -> std::io::Result<()> {
@@ -46,6 +48,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
     let mut connections: HashMap<RawFd, Connection> = HashMap::new();
     let mut pipes: HashMap<RawFd, RawFd> = HashMap::new();
     let mut reap: Vec<Child> = Vec::new();
+    let mut sessions = SessionStore::new();
 
     loop {
         let events = epoll.wait(MAX_EVENTS, POLL_TIMEOUT_MS)?;
@@ -61,7 +64,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
             let owner_fd = pipes.get(&ev.fd).copied().unwrap_or(ev.fd);
 
             let should_close = {
-                let mut ctx = EventCtx { epoll: &epoll, pipes: &mut pipes, reap: &mut reap };
+                let mut ctx = EventCtx { epoll: &epoll, pipes: &mut pipes, reap: &mut reap, sessions: &mut sessions };
                 match connections.get_mut(&owner_fd) {
                     Some(conn) => conn.on_event(&config, &mut ctx, ev),
                     None => continue, // stale event for a connection we already dropped
@@ -70,7 +73,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
 
             if should_close {
                 if let Some(mut conn) = connections.remove(&owner_fd) {
-                    let mut ctx = EventCtx { epoll: &epoll, pipes: &mut pipes, reap: &mut reap };
+                    let mut ctx = EventCtx { epoll: &epoll, pipes: &mut pipes, reap: &mut reap, sessions: &mut sessions };
                     conn.cleanup(&mut ctx);
                 }
                 epoll.remove(owner_fd);
@@ -78,7 +81,8 @@ pub fn run(config: Config) -> std::io::Result<()> {
         }
 
         reap.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
-        sweep_timeouts(&config, &epoll, &mut pipes, &mut reap, &mut connections);
+        sessions.sweep_expired();
+        sweep_timeouts(&config, &epoll, &mut pipes, &mut reap, &mut sessions, &mut connections);
     }
 }
 
@@ -109,6 +113,7 @@ fn sweep_timeouts(
     epoll: &Epoll,
     pipes: &mut HashMap<RawFd, RawFd>,
     reap: &mut Vec<Child>,
+    sessions: &mut SessionStore,
     connections: &mut HashMap<RawFd, Connection>,
 ) {
     let now = Instant::now();
@@ -116,7 +121,7 @@ fn sweep_timeouts(
 
     for fd in timed_out {
         let finished = {
-            let mut ctx = EventCtx { epoll, pipes, reap };
+            let mut ctx = EventCtx { epoll, pipes, reap, sessions };
             match connections.get_mut(&fd) {
                 Some(conn) => conn.handle_timeout(config, &mut ctx),
                 None => true,
@@ -124,7 +129,7 @@ fn sweep_timeouts(
         };
         if finished {
             if let Some(mut conn) = connections.remove(&fd) {
-                let mut ctx = EventCtx { epoll, pipes, reap };
+                let mut ctx = EventCtx { epoll, pipes, reap, sessions };
                 conn.cleanup(&mut ctx);
             }
             epoll.remove(fd);

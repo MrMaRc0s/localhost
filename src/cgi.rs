@@ -102,7 +102,15 @@ impl CgiProcess {
     }
 }
 
-pub fn spawn(cgi_req: &CgiRequest, req: &Request, server: &ServerConfig, listen: Listen, remote_addr: &str) -> std::io::Result<CgiProcess> {
+pub fn spawn(
+    cgi_req: &CgiRequest,
+    req: &Request,
+    server: &ServerConfig,
+    listen: Listen,
+    remote_addr: &str,
+    session_id: &str,
+    session_visits: u64,
+) -> std::io::Result<CgiProcess> {
     let mut cmd = Command::new(&cgi_req.interpreter);
     // "CGI expects the file to process as first argument."
     cmd.arg(&cgi_req.script_path);
@@ -113,7 +121,7 @@ pub fn spawn(cgi_req: &CgiRequest, req: &Request, server: &ServerConfig, listen:
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());
 
-    for (key, value) in build_env(cgi_req, req, server, listen, remote_addr) {
+    for (key, value) in build_env(cgi_req, req, server, listen, remote_addr, session_id, session_visits) {
         cmd.env(key, value);
     }
 
@@ -151,7 +159,15 @@ fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
 /// request header, which is how a CGI script reads cookies, user-agent,
 /// etc. Everything the script needs to know about the request that isn't
 /// the body itself travels through the environment, never argv.
-fn build_env(cgi_req: &CgiRequest, req: &Request, server: &ServerConfig, listen: Listen, remote_addr: &str) -> Vec<(String, String)> {
+fn build_env(
+    cgi_req: &CgiRequest,
+    req: &Request,
+    server: &ServerConfig,
+    listen: Listen,
+    remote_addr: &str,
+    session_id: &str,
+    session_visits: u64,
+) -> Vec<(String, String)> {
     let mut env = Vec::new();
     env.push(("GATEWAY_INTERFACE".to_string(), "CGI/1.1".to_string()));
     env.push(("SERVER_PROTOCOL".to_string(), format!("HTTP/{}.{}", req.version.0, req.version.1)));
@@ -178,6 +194,13 @@ fn build_env(cgi_req: &CgiRequest, req: &Request, server: &ServerConfig, listen:
     // Not part of RFC 3875, but a widely relied-on php-cgi convention that
     // costs nothing to also set for other interpreters.
     env.push(("REDIRECT_STATUS".to_string(), "200".to_string()));
+    // Also not standard CGI: the server already resolved (or minted) this
+    // request's session before running the script, so hand it over
+    // directly rather than making every script re-parse HTTP_COOKIE — the
+    // id is available here even on the very first request, before the
+    // client has seen the Set-Cookie this response is about to carry.
+    env.push(("SESSION_ID".to_string(), session_id.to_string()));
+    env.push(("SESSION_VISITS".to_string(), session_visits.to_string()));
 
     if let Some(ct) = req.header("content-type") {
         env.push(("CONTENT_TYPE".to_string(), ct.to_string()));

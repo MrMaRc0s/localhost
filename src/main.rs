@@ -5,6 +5,7 @@ mod fs_util;
 mod http;
 mod router;
 mod server;
+mod session;
 mod upload;
 
 fn main() {
