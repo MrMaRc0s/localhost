@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::{RouteConfig, ServerConfig};
-use crate::fs_util::{content_type_for, safe_join};
+use crate::fs_util::{content_type_for, safe_join, sanitize_segments};
 use crate::http::{Method, Request, Response};
 
 /// What the connection layer should do with a request once routing has
@@ -45,33 +45,73 @@ pub fn dispatch(server: &ServerConfig, req: &Request) -> Dispatch {
     let base_dir = route.root.as_deref().unwrap_or(&server.root);
     let remainder = strip_route_prefix(&route.path, &req.path);
 
+    // DELETE never falls through to directory-index / autoindex handling —
+    // it either removes the exact resource named or it doesn't.
+    if req.method == Method::Delete {
+        let fs_path = match safe_join(base_dir, &remainder) {
+            Some(p) => p,
+            None => return Dispatch::Response(super::error_page::build(Some(server), 403)),
+        };
+        return resolve_delete(server, &fs_path);
+    }
+
+    // A CGI match can be the exact resource (`/cgi-bin/app.py`) or carry
+    // a PATH_INFO tail (`/cgi-bin/app.py/foo/bar`) that would never stat()
+    // as a real file, so this walks path segments looking for the first
+    // one that's an actual file with a configured CGI extension — same
+    // traversal guard as safe_join, just applied one prefix at a time.
+    if let Some((interpreter, script_path, path_info)) = find_cgi_script(route, base_dir, &remainder) {
+        if matches!(req.method, Method::Get | Method::Head | Method::Post) {
+            return Dispatch::Cgi(CgiRequest {
+                interpreter,
+                script_dir: script_path.parent().unwrap_or(Path::new(".")).to_path_buf(),
+                path_info,
+                script_path,
+            });
+        }
+    }
+
+    if req.method == Method::Post {
+        return resolve_upload(server, route, base_dir, &remainder, req);
+    }
+
     let fs_path = match safe_join(base_dir, &remainder) {
         Some(p) => p,
         None => return Dispatch::Response(super::error_page::build(Some(server), 403)),
     };
-
-    // DELETE never falls through to directory-index / autoindex handling —
-    // it either removes the exact resource named or it doesn't.
-    if req.method == Method::Delete {
-        return resolve_delete(server, &fs_path);
-    }
-
-    // A POST that lands on an existing CGI script still needs to run
-    // through the CGI path below; otherwise treat it as a file upload.
-    if req.method == Method::Post && !matches_cgi_script(route, &fs_path) {
-        return resolve_upload(server, route, base_dir, &remainder, req);
-    }
-
     resolve_path(server, route, &fs_path, &remainder, req)
 }
 
-fn matches_cgi_script(route: &RouteConfig, fs_path: &Path) -> bool {
-    fs_path.is_file()
-        && fs_path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|ext| route.cgi.contains_key(&format!(".{}", ext)))
-            .unwrap_or(false)
+/// Walks `remainder`'s path segments one at a time looking for the
+/// shortest prefix that names a real file whose extension is configured
+/// for CGI on this route. Everything past that point becomes PATH_INFO.
+/// Returns `None` (not a traversal-invalid path, just "no CGI script
+/// found here") the moment a segment either doesn't exist or exists but
+/// isn't a directory to keep descending into.
+fn find_cgi_script(route: &RouteConfig, base_dir: &str, remainder: &str) -> Option<(String, PathBuf, String)> {
+    if route.cgi.is_empty() {
+        return None;
+    }
+    let segments = sanitize_segments(remainder)?;
+
+    let mut candidate = PathBuf::from(base_dir);
+    for (i, segment) in segments.iter().enumerate() {
+        candidate.push(segment);
+
+        let meta = std::fs::metadata(&candidate).ok()?;
+        if meta.is_file() {
+            let ext = candidate.extension().and_then(|e| e.to_str())?;
+            let interpreter = route.cgi.get(&format!(".{}", ext))?;
+            let path_info = if i + 1 < segments.len() { format!("/{}", segments[i + 1..].join("/")) } else { String::new() };
+            return Some((interpreter.clone(), candidate, path_info));
+        }
+        // A file that isn't a recognized CGI script ends the search
+        // (can't descend "into" a file); a directory just keeps going.
+        if !meta.is_dir() {
+            return None;
+        }
+    }
+    None
 }
 
 fn resolve_delete(server: &ServerConfig, fs_path: &Path) -> Dispatch {

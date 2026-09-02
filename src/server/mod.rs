@@ -5,6 +5,7 @@ pub mod listener;
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::process::Child;
 use std::time::Instant;
 
 use crate::config::{Config, Listen};
@@ -12,16 +13,30 @@ use connection::Connection;
 use epoll::Epoll;
 
 const MAX_EVENTS: usize = 1024;
-/// Also doubles as how often we sweep for timed-out connections, since
-/// that's the only other thing the loop needs to do besides react to I/O.
+/// Also doubles as how often we sweep for timed-out connections and
+/// reap finished CGI children, since those are the only other things the
+/// loop needs to do besides react to I/O.
 const POLL_TIMEOUT_MS: i32 = 1000;
 
+/// Everything a `Connection` needs to touch outside of itself while
+/// handling one event: the shared epoll instance, the registry mapping a
+/// CGI pipe fd back to the client fd that owns it (so the main loop can
+/// route a pipe's readiness event to the right `Connection`), and the
+/// list of CGI children that have been killed/finished but not yet
+/// reaped. Bundled into one struct purely so connection.rs doesn't have
+/// to thread three separate `&mut` parameters through every method.
+pub struct EventCtx<'a> {
+    pub epoll: &'a Epoll,
+    pub pipes: &'a mut HashMap<RawFd, RawFd>,
+    pub reap: &'a mut Vec<Child>,
+}
+
 pub fn run(config: Config) -> std::io::Result<()> {
-    // We do our own error handling on every write()/read() return value;
-    // a `SIGPIPE` from writing to a socket the client already closed
-    // should surface as an `EPIPE` error there, not take the process
-    // down (std normally leaves this ignored already, but we make it
-    // explicit since we also touch raw fds directly via libc elsewhere).
+    // We check every syscall's return value ourselves; a SIGPIPE from
+    // writing to a socket the client already closed should surface as an
+    // EPIPE error there, not take the process down (std leaves this
+    // ignored by default, but we make it explicit since we also touch
+    // raw fds directly via libc elsewhere).
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
@@ -29,6 +44,8 @@ pub fn run(config: Config) -> std::io::Result<()> {
     let epoll = Epoll::new()?;
     let listeners = listener::bind_all(&config, &epoll)?;
     let mut connections: HashMap<RawFd, Connection> = HashMap::new();
+    let mut pipes: HashMap<RawFd, RawFd> = HashMap::new();
+    let mut reap: Vec<Child> = Vec::new();
 
     loop {
         let events = epoll.wait(MAX_EVENTS, POLL_TIMEOUT_MS)?;
@@ -39,17 +56,29 @@ pub fn run(config: Config) -> std::io::Result<()> {
                 continue;
             }
 
-            let should_close = match connections.get_mut(&ev.fd) {
-                Some(conn) => conn.on_event(&config, &epoll, ev),
-                None => continue, // stale event for an fd we already dropped
+            // A CGI pipe fd resolves to the client fd that owns it; a
+            // plain client-socket event resolves to itself.
+            let owner_fd = pipes.get(&ev.fd).copied().unwrap_or(ev.fd);
+
+            let should_close = {
+                let mut ctx = EventCtx { epoll: &epoll, pipes: &mut pipes, reap: &mut reap };
+                match connections.get_mut(&owner_fd) {
+                    Some(conn) => conn.on_event(&config, &mut ctx, ev),
+                    None => continue, // stale event for a connection we already dropped
+                }
             };
+
             if should_close {
-                epoll.remove(ev.fd);
-                connections.remove(&ev.fd);
+                if let Some(mut conn) = connections.remove(&owner_fd) {
+                    let mut ctx = EventCtx { epoll: &epoll, pipes: &mut pipes, reap: &mut reap };
+                    conn.cleanup(&mut ctx);
+                }
+                epoll.remove(owner_fd);
             }
         }
 
-        sweep_timeouts(&config, &epoll, &mut connections);
+        reap.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+        sweep_timeouts(&config, &epoll, &mut pipes, &mut reap, &mut connections);
     }
 }
 
@@ -75,18 +104,30 @@ fn accept_one(listen: Listen, tcp: &TcpListener, epoll: &Epoll, connections: &mu
     }
 }
 
-fn sweep_timeouts(config: &Config, epoll: &Epoll, connections: &mut HashMap<RawFd, Connection>) {
+fn sweep_timeouts(
+    config: &Config,
+    epoll: &Epoll,
+    pipes: &mut HashMap<RawFd, RawFd>,
+    reap: &mut Vec<Child>,
+    connections: &mut HashMap<RawFd, Connection>,
+) {
     let now = Instant::now();
     let timed_out: Vec<RawFd> = connections.iter().filter(|(_, c)| c.is_timed_out(now)).map(|(fd, _)| *fd).collect();
 
     for fd in timed_out {
-        let finished = match connections.get_mut(&fd) {
-            Some(conn) => conn.handle_timeout(config, epoll),
-            None => true,
+        let finished = {
+            let mut ctx = EventCtx { epoll, pipes, reap };
+            match connections.get_mut(&fd) {
+                Some(conn) => conn.handle_timeout(config, &mut ctx),
+                None => true,
+            }
         };
         if finished {
+            if let Some(mut conn) = connections.remove(&fd) {
+                let mut ctx = EventCtx { epoll, pipes, reap };
+                conn.cleanup(&mut ctx);
+            }
             epoll.remove(fd);
-            connections.remove(&fd);
         }
     }
 }

@@ -38,6 +38,20 @@ pub fn content_type_for(path: &Path) -> &'static str {
 /// the OS afterwards — that's ordinary filesystem behavior, not something
 /// this function is responsible for.)
 pub fn safe_join(root: &str, request_path: &str) -> Option<PathBuf> {
+    let stack = sanitize_segments(request_path)?;
+    let mut result = PathBuf::from(root);
+    for s in stack {
+        result.push(s);
+    }
+    Some(result)
+}
+
+/// Walks `request_path` into the segment stack `safe_join` builds a path
+/// from, without actually joining it to a root yet — exposed so callers
+/// that need to inspect each intermediate prefix (e.g. hunting for a CGI
+/// script somewhere along a PATH_INFO-bearing URL) can reuse the same
+/// traversal guard instead of re-implementing it.
+pub fn sanitize_segments(request_path: &str) -> Option<Vec<&str>> {
     let mut stack: Vec<&str> = Vec::new();
     for segment in request_path.split('/') {
         match segment {
@@ -48,11 +62,7 @@ pub fn safe_join(root: &str, request_path: &str) -> Option<PathBuf> {
             s => stack.push(s),
         }
     }
-    let mut result = PathBuf::from(root);
-    for s in stack {
-        result.push(s);
-    }
-    Some(result)
+    Some(stack)
 }
 
 #[cfg(test)]

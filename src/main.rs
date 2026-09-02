@@ -1,3 +1,4 @@
+mod cgi;
 mod config;
 mod error_page;
 mod fs_util;
