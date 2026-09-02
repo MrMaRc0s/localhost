@@ -66,7 +66,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
             let should_close = {
                 let mut ctx = EventCtx { epoll: &epoll, pipes: &mut pipes, reap: &mut reap, sessions: &mut sessions };
                 match connections.get_mut(&owner_fd) {
-                    Some(conn) => conn.on_event(&config, &mut ctx, ev),
+                    Some(conn) => guard_panic(owner_fd, || conn.on_event(&config, &mut ctx, ev)),
                     None => continue, // stale event for a connection we already dropped
                 }
             };
@@ -83,6 +83,24 @@ pub fn run(config: Config) -> std::io::Result<()> {
         reap.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
         sessions.sweep_expired();
         sweep_timeouts(&config, &epoll, &mut pipes, &mut reap, &mut sessions, &mut connections);
+    }
+}
+
+/// Runs `f` (which handles exactly one connection) behind
+/// `catch_unwind`, so a bug that panics while serving one client — a
+/// malformed request tripping an unhandled edge case, say — takes down
+/// only that one connection instead of the whole process. `AssertUnwindSafe`
+/// is sound here specifically because the caller always discards the
+/// connection (closes the fd, drops it from the map) whenever this
+/// returns via the panic path, so a partially-mutated `Connection` is
+/// never touched again.
+fn guard_panic<F: FnOnce() -> bool>(fd: RawFd, f: F) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(should_close) => should_close,
+        Err(_) => {
+            eprintln!("localhost: recovered from an internal error handling fd {} — closing that connection", fd);
+            true
+        }
     }
 }
 
@@ -123,7 +141,7 @@ fn sweep_timeouts(
         let finished = {
             let mut ctx = EventCtx { epoll, pipes, reap, sessions };
             match connections.get_mut(&fd) {
-                Some(conn) => conn.handle_timeout(config, &mut ctx),
+                Some(conn) => guard_panic(fd, || conn.handle_timeout(config, &mut ctx)),
                 None => true,
             }
         };

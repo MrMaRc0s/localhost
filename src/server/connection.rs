@@ -378,9 +378,12 @@ impl Connection {
     }
 
     fn fail_body_error(&mut self, err: BodyError, req: Option<&Request>, config: &Config, ctx: &mut EventCtx) -> bool {
-        let code = match err {
+        let code = match &err {
             BodyError::TooLarge => 413,
-            BodyError::Malformed(_) => 400,
+            BodyError::Malformed(reason) => {
+                eprintln!("localhost: fd {}: malformed request body: {}", self.fd, reason);
+                400
+            }
         };
         let server = config.resolve(self.listen, req.and_then(|r| r.header("host")));
         let resp = crate::error_page::build(server, code);
@@ -389,11 +392,14 @@ impl Connection {
     }
 
     fn fail_parse_error(&mut self, err: ParseError, ctx: &mut EventCtx) -> bool {
-        let code = match err {
+        let code = match &err {
             ParseError::UriTooLong => 414,
             ParseError::HeadTooLarge => 400,
             ParseError::VersionNotSupported => 505,
-            ParseError::BadRequest(_) => 400,
+            ParseError::BadRequest(reason) => {
+                eprintln!("localhost: fd {}: bad request: {}", self.fd, reason);
+                400
+            }
         };
         let resp = crate::error_page::build(None, code);
         self.begin_write(resp, false, false, ctx.epoll);

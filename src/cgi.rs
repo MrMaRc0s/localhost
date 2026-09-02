@@ -1,7 +1,6 @@
 use std::io::{Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Instant;
 
 use crate::config::{Listen, ServerConfig};
 use crate::http::{Request, Response};
@@ -19,7 +18,6 @@ pub struct CgiProcess {
     input: Vec<u8>,
     input_written: usize,
     pub output: Vec<u8>,
-    pub started_at: Instant,
 }
 
 pub enum WriteOutcome {
@@ -140,7 +138,7 @@ pub fn spawn(
         set_nonblocking(s.as_raw_fd())?;
     }
 
-    Ok(CgiProcess { child, stdin, stdout, input, input_written: 0, output: Vec::new(), started_at: Instant::now() })
+    Ok(CgiProcess { child, stdin, stdout, input, input_written: 0, output: Vec::new() })
 }
 
 fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
@@ -181,6 +179,10 @@ fn build_env(
     env.push(("SERVER_NAME".to_string(), server_name));
 
     env.push(("REQUEST_METHOD".to_string(), req.raw_method.clone()));
+    // Not part of RFC 3875 either, but ubiquitous enough in real CGI/PHP
+    // scripts (they expect it for building self-referential links) that
+    // it's worth setting alongside the standard variables above.
+    env.push(("REQUEST_URI".to_string(), req.target.clone()));
 
     let script_name_len = req.path.len().saturating_sub(cgi_req.path_info.len());
     env.push(("SCRIPT_NAME".to_string(), req.path[..script_name_len].to_string()));

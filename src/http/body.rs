@@ -68,10 +68,6 @@ impl BodyReader {
         self.done
     }
 
-    pub fn body(&self) -> &[u8] {
-        &self.body
-    }
-
     pub fn into_body(self) -> Vec<u8> {
         self.body
     }
@@ -185,7 +181,7 @@ mod tests {
         let mut r = BodyReader::new(Mode::ContentLength(5), 1024);
         r.feed(b"hello").unwrap();
         assert!(r.is_done());
-        assert_eq!(r.body(), b"hello");
+        assert_eq!(r.into_body(), b"hello");
     }
 
     #[test]
@@ -195,7 +191,7 @@ mod tests {
         assert!(!r.is_done());
         r.feed(b"llo").unwrap();
         assert!(r.is_done());
-        assert_eq!(r.body(), b"hello");
+        assert_eq!(r.into_body(), b"hello");
     }
 
     #[test]
@@ -203,8 +199,8 @@ mod tests {
         let mut r = BodyReader::new(Mode::ContentLength(5), 1024);
         r.feed(b"helloGET / HTTP/1.1").unwrap();
         assert!(r.is_done());
-        assert_eq!(r.body(), b"hello");
         assert_eq!(r.take_trailing(), b"GET / HTTP/1.1");
+        assert_eq!(r.into_body(), b"hello");
     }
 
     #[test]
@@ -212,7 +208,7 @@ mod tests {
         let mut r = BodyReader::new(Mode::Chunked, 1024);
         r.feed(b"4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n").unwrap();
         assert!(r.is_done());
-        assert_eq!(r.body(), b"Wikipedia");
+        assert_eq!(r.into_body(), b"Wikipedia");
     }
 
     #[test]
@@ -222,7 +218,7 @@ mod tests {
         assert!(!r.is_done());
         r.feed(b"ki\r\n0\r\n\r\n").unwrap();
         assert!(r.is_done());
-        assert_eq!(r.body(), b"Wiki");
+        assert_eq!(r.into_body(), b"Wiki");
     }
 
     #[test]
@@ -237,7 +233,7 @@ mod tests {
         let mut r = BodyReader::new(Mode::Chunked, 1024);
         r.feed(b"3\r\nfoo\r\n0\r\nX-Trailer: yes\r\n\r\n").unwrap();
         assert!(r.is_done());
-        assert_eq!(r.body(), b"foo");
+        assert_eq!(r.into_body(), b"foo");
     }
 
     #[test]

@@ -5,7 +5,6 @@ pub mod request;
 pub mod response;
 pub mod status;
 
-pub use body::BodyReader;
 pub use method::Method;
 pub use request::Request;
 pub use response::Response;

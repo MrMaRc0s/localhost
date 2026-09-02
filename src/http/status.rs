@@ -39,11 +39,3 @@ pub fn reason_phrase(code: u16) -> &'static str {
         _ => "Internal Server Error",
     }
 }
-
-pub fn is_client_error(code: u16) -> bool {
-    (400..500).contains(&code)
-}
-
-pub fn is_server_error(code: u16) -> bool {
-    (500..600).contains(&code)
-}

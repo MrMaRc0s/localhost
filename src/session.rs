@@ -11,8 +11,6 @@ pub const COOKIE_NAME: &str = "localhost_session";
 pub const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
 
 pub struct Session {
-    pub id: String,
-    pub created: Instant,
     pub last_seen: Instant,
     /// Small free-form store a route handler could use (not currently
     /// exposed to CGI beyond the visit counter below, but here so the
@@ -21,9 +19,8 @@ pub struct Session {
 }
 
 impl Session {
-    fn new(id: String) -> Self {
-        let now = Instant::now();
-        Session { id, created: now, last_seen: now, data: HashMap::new() }
+    fn new() -> Self {
+        Session { last_seen: Instant::now(), data: HashMap::new() }
     }
 }
 
@@ -49,7 +46,7 @@ impl SessionStore {
             }
         }
         let id = generate_id();
-        self.sessions.insert(id.clone(), Session::new(id.clone()));
+        self.sessions.insert(id.clone(), Session::new());
         (id, true)
     }
 

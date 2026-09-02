@@ -28,11 +28,6 @@ impl Response {
         Response::new(status).header("Content-Type", "text/html; charset=utf-8").body(body)
     }
 
-    pub fn text(status: u16, body: impl Into<String>) -> Self {
-        let body = body.into().into_bytes();
-        Response::new(status).header("Content-Type", "text/plain; charset=utf-8").body(body)
-    }
-
     pub fn redirect(status: u16, location: &str) -> Self {
         let body = format!(
             "<html><body>{} — <a href=\"{}\">{}</a></body></html>",

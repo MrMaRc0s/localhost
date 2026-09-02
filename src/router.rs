@@ -120,7 +120,10 @@ fn resolve_delete(server: &ServerConfig, fs_path: &Path) -> Dispatch {
         DeleteOutcome::Deleted => Response::no_content(204),
         DeleteOutcome::NotFound => super::error_page::build(Some(server), 404),
         DeleteOutcome::Forbidden => super::error_page::build(Some(server), 403),
-        DeleteOutcome::Error(_) => super::error_page::build(Some(server), 500),
+        DeleteOutcome::Error(reason) => {
+            eprintln!("localhost: DELETE {}: {}", fs_path.display(), reason);
+            super::error_page::build(Some(server), 500)
+        }
     };
     Dispatch::Response(resp)
 }
@@ -133,7 +136,10 @@ fn resolve_upload(server: &ServerConfig, route: &RouteConfig, base_dir: &str, re
             Response::html(201, format!("<p>Uploaded: {}</p>", html_escape(&list)))
                 .header("Location", req.path.clone())
         }
-        Err(_) => super::error_page::build(Some(server), 400),
+        Err(reason) => {
+            eprintln!("localhost: upload to {} failed: {}", store_dir, reason);
+            super::error_page::build(Some(server), 400)
+        }
     };
     Dispatch::Response(resp)
 }

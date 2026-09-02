@@ -51,7 +51,7 @@ fn tokenize(src: &str) -> Vec<Tok> {
     let mut line = 1usize;
     let mut current = String::new();
 
-    let mut flush = |current: &mut String, line: usize, tokens: &mut Vec<Tok>| {
+    let flush = |current: &mut String, line: usize, tokens: &mut Vec<Tok>| {
         if !current.is_empty() {
             tokens.push(Tok { text: std::mem::take(current), line });
         }

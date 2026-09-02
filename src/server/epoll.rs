@@ -7,10 +7,6 @@ use std::os::unix::io::RawFd;
 
 pub const READABLE: u32 = libc::EPOLLIN as u32;
 pub const WRITABLE: u32 = libc::EPOLLOUT as u32;
-/// Always delivered by the kernel regardless of the requested event mask;
-/// listed here only so call sites can name it when reasoning about events.
-pub const HUP: u32 = libc::EPOLLHUP as u32;
-pub const ERR: u32 = libc::EPOLLERR as u32;
 
 pub struct Event {
     pub fd: RawFd,
