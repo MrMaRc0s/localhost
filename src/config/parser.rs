@@ -50,6 +50,11 @@ fn tokenize(src: &str) -> Vec<Tok> {
     let mut tokens = Vec::new();
     let mut line = 1usize;
     let mut current = String::new();
+    // The spec doesn't require comment support, but a config file with
+    // no way to leave a note next to a directive is painful to author by
+    // hand, so `#` through end-of-line is stripped like a shell/nginx
+    // comment before anything else sees it.
+    let mut in_comment = false;
 
     let flush = |current: &mut String, line: usize, tokens: &mut Vec<Tok>| {
         if !current.is_empty() {
@@ -58,7 +63,18 @@ fn tokenize(src: &str) -> Vec<Tok> {
     };
 
     for ch in src.chars() {
+        if in_comment {
+            if ch == '\n' {
+                in_comment = false;
+                line += 1;
+            }
+            continue;
+        }
         match ch {
+            '#' => {
+                flush(&mut current, line, &mut tokens);
+                in_comment = true;
+            }
             '\n' => {
                 flush(&mut current, line, &mut tokens);
                 line += 1;
@@ -340,4 +356,57 @@ fn parse_size(value: &str, line: usize) -> Result<usize, ConfigError> {
         .parse()
         .map_err(|_| ConfigError::new(format!("line {}: invalid size `{}`", line, value)))?;
     Ok(base * multiplier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_minimal_server_block() {
+        let cfg = parse_str("server { listen 8080; route / { methods GET; } }").unwrap();
+        assert_eq!(cfg.servers.len(), 1);
+        assert_eq!(cfg.servers[0].listens[0].port, 8080);
+        assert_eq!(cfg.servers[0].routes[0].path, "/");
+    }
+
+    #[test]
+    fn strips_hash_comments() {
+        let src = "# top-level note\nserver {\n  listen 8080; # inline note\n  route / { methods GET; }\n}\n";
+        let cfg = parse_str(src).unwrap();
+        assert_eq!(cfg.servers[0].listens[0].port, 8080);
+    }
+
+    #[test]
+    fn parses_client_max_body_size_suffixes() {
+        let cfg = parse_str("server { listen 8080; client_max_body_size 2m; route / { methods GET; } }").unwrap();
+        assert_eq!(cfg.servers[0].client_max_body_size, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parses_error_page_with_multiple_codes() {
+        let cfg = parse_str("server { listen 8080; error_page 500 502 /5xx.html; route / { methods GET; } }").unwrap();
+        assert_eq!(cfg.servers[0].error_pages.get(&500).map(String::as_str), Some("/5xx.html"));
+        assert_eq!(cfg.servers[0].error_pages.get(&502).map(String::as_str), Some("/5xx.html"));
+    }
+
+    #[test]
+    fn rejects_server_block_without_listen() {
+        let err = parse_str("server { route / { methods GET; } }").unwrap_err();
+        assert!(err.0.contains("listen"));
+    }
+
+    #[test]
+    fn rejects_duplicate_default_servers_on_same_listen() {
+        let src = "server { listen 8080; route / { methods GET; } } server { listen 8080; route / { methods GET; } }";
+        let err = parse_str(src).unwrap_err();
+        assert!(err.0.contains("default"));
+    }
+
+    #[test]
+    fn allows_virtual_hosts_disambiguated_by_server_name() {
+        let src = "server { listen 8080; server_name a.test; route / { methods GET; } } \
+                   server { listen 8080; server_name b.test; route / { methods GET; } }";
+        assert!(parse_str(src).is_ok());
+    }
 }

@@ -109,12 +109,23 @@ pub fn spawn(
     session_id: &str,
     session_visits: u64,
 ) -> std::io::Result<CgiProcess> {
+    // Both the script path we pass as argv[1] and the directory we're
+    // about to chdir into are typically relative (config roots are
+    // written relative to wherever the server was launched from). A
+    // relative argv[1] is resolved against the *child's* cwd, which is
+    // about to become script_dir — so passing the relative script_path
+    // as-is would resolve against itself and double-join into a path
+    // that doesn't exist. Canonicalizing first (the file's existence was
+    // already confirmed by the router) sidesteps that entirely.
+    let script_path = std::fs::canonicalize(&cgi_req.script_path).unwrap_or_else(|_| cgi_req.script_path.clone());
+    let script_dir = std::fs::canonicalize(&cgi_req.script_dir).unwrap_or_else(|_| cgi_req.script_dir.clone());
+
     let mut cmd = Command::new(&cgi_req.interpreter);
     // "CGI expects the file to process as first argument."
-    cmd.arg(&cgi_req.script_path);
+    cmd.arg(&script_path);
     // Run from the script's own directory so relative paths it opens
     // resolve the way the script author expects.
-    cmd.current_dir(&cgi_req.script_dir);
+    cmd.current_dir(&script_dir);
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::null());

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>localhost</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #14161a; color: #e8e8e8; padding: 2rem;
+  }
+  main { max-width: 640px; }
+  h1 { font-size: 2.2rem; margin: 0 0 0.25rem; letter-spacing: -0.5px; }
+  .tag { color: #6cb2ff; font-family: ui-monospace, Menlo, monospace; font-size: 0.95rem; margin-bottom: 2rem; }
+  ul { list-style: none; padding: 0; display: grid; gap: 0.6rem; }
+  li a {
+    display: block; padding: 0.85rem 1rem; border-radius: 10px; background: #1c1f26;
+    border: 1px solid #2a2d33; color: #e8e8e8; text-decoration: none; transition: border-color .15s;
+  }
+  li a:hover { border-color: #6cb2ff; }
+  .path { color: #6cb2ff; font-family: ui-monospace, Menlo, monospace; font-size: 0.85rem; }
+  footer { margin-top: 2rem; color: #5f6368; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>localhost</h1>
+  <p class="tag">single-threaded &middot; epoll &middot; HTTP/1.1 &middot; Rust</p>
+  <ul>
+    <li><a href="/files/"><span class="path">/files/</span><br>Directory listing (autoindex)</a></li>
+    <li><a href="/uploads/"><span class="path">/uploads/</span><br>Upload &amp; delete a file (GET, POST, DELETE)</a></li>
+    <li><a href="/cgi-bin/hello.py"><span class="path">/cgi-bin/hello.py</span><br>Python CGI demo, with session cookies</a></li>
+    <li><a href="/old-page"><span class="path">/old-page</span><br>Redirects to this page (301)</a></li>
+    <li><a href="/does-not-exist"><span class="path">/does-not-exist</span><br>Custom 404 page</a></li>
+  </ul>
+  <footer>Served by localhost/0.1 &mdash; see <code>config/default.conf</code>.</footer>
+</main>
+</body>
+</html>
