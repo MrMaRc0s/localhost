@@ -2,6 +2,7 @@ mod config;
 mod error_page;
 mod fs_util;
 mod http;
+mod router;
 mod server;
 
 fn main() {
