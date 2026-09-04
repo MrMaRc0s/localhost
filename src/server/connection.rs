@@ -26,9 +26,16 @@ const CGI_TIMEOUT: Duration = Duration::from_secs(15);
 
 enum State {
     ReadingHead,
-    ReadingBody { request: Request, body: BodyReader },
+    ReadingBody {
+        request: Request,
+        body: BodyReader,
+    },
     RunningCgi(CgiProcess),
-    Writing { buf: Vec<u8>, written: usize, close_after: bool },
+    Writing {
+        buf: Vec<u8>,
+        written: usize,
+        close_after: bool,
+    },
 }
 
 pub struct Connection {
@@ -51,7 +58,10 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(fd: RawFd, stream: TcpStream, listen: Listen) -> Self {
-        let peer_addr = stream.peer_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| "0.0.0.0".to_string());
+        let peer_addr = stream
+            .peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|_| "0.0.0.0".to_string());
         Connection {
             fd,
             stream,
@@ -97,8 +107,10 @@ impl Connection {
         // here before the response has even been produced. `event.fd`
         // itself (not the readable/writable/error bits, which EPOLLHUP
         // can set on either pipe) says which of the two this is.
-        let is_stdin = matches!(&self.state, State::RunningCgi(cgi) if Some(event.fd) == cgi.stdin_fd());
-        let is_stdout = matches!(&self.state, State::RunningCgi(cgi) if event.fd == cgi.stdout_fd());
+        let is_stdin =
+            matches!(&self.state, State::RunningCgi(cgi) if Some(event.fd) == cgi.stdin_fd());
+        let is_stdout =
+            matches!(&self.state, State::RunningCgi(cgi) if event.fd == cgi.stdout_fd());
         if is_stdin {
             self.cgi_write_once(ctx, event.fd);
         }
@@ -165,7 +177,11 @@ impl Connection {
 
     fn write_once(&mut self, config: &Config, ctx: &mut EventCtx) -> bool {
         let outcome = match &mut self.state {
-            State::Writing { buf, written, close_after } => match self.stream.write(&buf[*written..]) {
+            State::Writing {
+                buf,
+                written,
+                close_after,
+            } => match self.stream.write(&buf[*written..]) {
                 Ok(0) => return true,
                 Ok(n) => {
                     *written += n;
@@ -279,7 +295,11 @@ impl Connection {
             .and_then(|h| crate::session::extract_cookie(h, crate::session::COOKIE_NAME));
         let (session_id, is_new) = ctx.sessions.touch(existing.as_deref());
         if is_new {
-            self.pending_set_cookie = Some(format!("{}={}; Path=/; HttpOnly; SameSite=Lax", crate::session::COOKIE_NAME, session_id));
+            self.pending_set_cookie = Some(format!(
+                "{}={}; Path=/; HttpOnly; SameSite=Lax",
+                crate::session::COOKIE_NAME,
+                session_id
+            ));
         }
         let visits = ctx.sessions.increment_visit_count(&session_id);
 
@@ -302,7 +322,15 @@ impl Connection {
         session_visits: u64,
         ctx: &mut EventCtx,
     ) {
-        match cgi::spawn(&cgi_req, req, server, self.listen, &self.peer_addr, session_id, session_visits) {
+        match cgi::spawn(
+            &cgi_req,
+            req,
+            server,
+            self.listen,
+            &self.peer_addr,
+            session_id,
+            session_visits,
+        ) {
             Ok(process) => {
                 if let Some(stdin_fd) = process.stdin_fd() {
                     if ctx.epoll.add(stdin_fd, epoll::WRITABLE).is_ok() {
@@ -317,13 +345,20 @@ impl Connection {
             }
             Err(_) => {
                 let resp = crate::error_page::build(Some(server), 500);
-                self.begin_write(resp, self.pending_keep_alive, self.pending_for_head, ctx.epoll);
+                self.begin_write(
+                    resp,
+                    self.pending_keep_alive,
+                    self.pending_for_head,
+                    ctx.epoll,
+                );
             }
         }
     }
 
     fn cgi_write_once(&mut self, ctx: &mut EventCtx, fd: RawFd) {
-        let State::RunningCgi(cgi) = &mut self.state else { return };
+        let State::RunningCgi(cgi) = &mut self.state else {
+            return;
+        };
         match cgi.write_stdin_once() {
             WriteOutcome::Pending => {}
             WriteOutcome::Done | WriteOutcome::Error => {
@@ -334,7 +369,9 @@ impl Connection {
     }
 
     fn cgi_read_once(&mut self, config: &Config, ctx: &mut EventCtx, fd: RawFd) {
-        let State::RunningCgi(cgi) = &mut self.state else { return };
+        let State::RunningCgi(cgi) = &mut self.state else {
+            return;
+        };
         match cgi.read_stdout_once() {
             ReadOutcome::Pending => {}
             ReadOutcome::Eof | ReadOutcome::Error => {
@@ -364,7 +401,12 @@ impl Connection {
             ctx.reap.push(cgi.into_child());
         }
 
-        self.begin_write(response, self.pending_keep_alive, self.pending_for_head, ctx.epoll);
+        self.begin_write(
+            response,
+            self.pending_keep_alive,
+            self.pending_for_head,
+            ctx.epoll,
+        );
     }
 
     fn begin_write(&mut self, response: Response, keep_alive: bool, for_head: bool, epoll: &Epoll) {
@@ -373,15 +415,35 @@ impl Connection {
             None => response,
         };
         let buf = response.serialize(keep_alive, for_head);
-        self.state = State::Writing { buf, written: 0, close_after: !keep_alive };
+        self.state = State::Writing {
+            buf,
+            written: 0,
+            close_after: !keep_alive,
+        };
         let _ = epoll.modify(self.fd, epoll::WRITABLE);
     }
 
-    fn fail_body_error(&mut self, err: BodyError, req: Option<&Request>, config: &Config, ctx: &mut EventCtx) -> bool {
+    fn fail_body_error(
+        &mut self,
+        err: BodyError,
+        req: Option<&Request>,
+        config: &Config,
+        ctx: &mut EventCtx,
+    ) -> bool {
         let code = match &err {
             BodyError::TooLarge => 413,
+            BodyError::UnsupportedTransferCoding(coding) => {
+                eprintln!(
+                    "localhost: fd {}: unsupported transfer coding: {}",
+                    self.fd, coding
+                );
+                501
+            }
             BodyError::Malformed(reason) => {
-                eprintln!("localhost: fd {}: malformed request body: {}", self.fd, reason);
+                eprintln!(
+                    "localhost: fd {}: malformed request body: {}",
+                    self.fd, reason
+                );
                 400
             }
         };
@@ -394,7 +456,7 @@ impl Connection {
     fn fail_parse_error(&mut self, err: ParseError, ctx: &mut EventCtx) -> bool {
         let code = match &err {
             ParseError::UriTooLong => 414,
-            ParseError::HeadTooLarge => 400,
+            ParseError::HeadTooLarge => 431,
             ParseError::VersionNotSupported => 505,
             ParseError::BadRequest(reason) => {
                 eprintln!("localhost: fd {}: bad request: {}", self.fd, reason);

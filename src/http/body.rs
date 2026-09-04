@@ -4,7 +4,11 @@ use super::request::Request;
 pub enum BodyError {
     TooLarge,
     Malformed(String),
+    UnsupportedTransferCoding(String),
 }
+
+const MAX_CHUNK_SIZE_LINE: usize = 64;
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 enum Mode {
@@ -20,16 +24,36 @@ enum Mode {
 /// configured `client_max_body_size` up front, before we bother reading
 /// any of it.
 pub fn determine_mode(req: &Request, max_size: usize) -> Result<BodyReader, BodyError> {
-    let chunked = req.is_chunked();
-    let content_length = req.content_length();
+    let transfer_codings = transfer_codings(req)?;
+    let content_length = content_length(req)?;
 
-    if chunked && content_length.is_some() {
+    if !transfer_codings.is_empty() && content_length.is_some() {
         return Err(BodyError::Malformed(
             "request has both Content-Length and Transfer-Encoding".into(),
         ));
     }
 
-    let mode = if chunked {
+    let mode = if !transfer_codings.is_empty() {
+        let chunked_count = transfer_codings
+            .iter()
+            .filter(|coding| coding.as_str() == "chunked")
+            .count();
+        if chunked_count > 1 {
+            return Err(BodyError::Malformed(
+                "chunked transfer coding is repeated".into(),
+            ));
+        }
+        if chunked_count == 1 && transfer_codings.last().map(String::as_str) != Some("chunked") {
+            return Err(BodyError::Malformed(
+                "chunked must be the final transfer coding".into(),
+            ));
+        }
+        if let Some(unsupported) = transfer_codings
+            .iter()
+            .find(|coding| coding.as_str() != "chunked")
+        {
+            return Err(BodyError::UnsupportedTransferCoding(unsupported.clone()));
+        }
         Mode::Chunked
     } else if let Some(len) = content_length {
         if len > max_size {
@@ -41,6 +65,42 @@ pub fn determine_mode(req: &Request, max_size: usize) -> Result<BodyReader, Body
     };
 
     Ok(BodyReader::new(mode, max_size))
+}
+
+fn content_length(req: &Request) -> Result<Option<usize>, BodyError> {
+    let values: Vec<&str> = req.header_values("content-length").collect();
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.len() != 1 || values[0].contains(',') {
+        return Err(BodyError::Malformed(
+            "request contains multiple Content-Length values".into(),
+        ));
+    }
+
+    let value = values[0].trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(BodyError::Malformed("invalid Content-Length".into()));
+    }
+    value
+        .parse::<usize>()
+        .map(Some)
+        .map_err(|_| BodyError::Malformed("Content-Length is too large".into()))
+}
+
+fn transfer_codings(req: &Request) -> Result<Vec<String>, BodyError> {
+    let mut codings = Vec::new();
+    for value in req.header_values("transfer-encoding") {
+        for coding in value.split(',') {
+            let coding = coding.trim().to_ascii_lowercase();
+            if coding.is_empty() {
+                return Err(BodyError::Malformed("empty transfer coding".into()));
+            }
+            codings.push(coding);
+        }
+    }
+
+    Ok(codings)
 }
 
 /// Incrementally decodes a request body (fixed-length or chunked) as bytes
@@ -61,7 +121,14 @@ pub struct BodyReader {
 impl BodyReader {
     fn new(mode: Mode, max_size: usize) -> Self {
         let done = matches!(mode, Mode::None);
-        BodyReader { mode, max_size, body: Vec::new(), trailing: Vec::new(), chunk_buf: Vec::new(), done }
+        BodyReader {
+            mode,
+            max_size,
+            body: Vec::new(),
+            trailing: Vec::new(),
+            chunk_buf: Vec::new(),
+            done,
+        }
     }
 
     pub fn is_done(&self) -> bool {
@@ -112,12 +179,15 @@ impl BodyReader {
             let size_line_end = match find(&self.chunk_buf, b"\r\n") {
                 Some(pos) => pos,
                 None => {
-                    if self.chunk_buf.len() > 64 {
+                    if self.chunk_buf.len() > MAX_CHUNK_SIZE_LINE {
                         return Err(BodyError::Malformed("chunk size line too long".into()));
                     }
                     break;
                 }
             };
+            if size_line_end > MAX_CHUNK_SIZE_LINE {
+                return Err(BodyError::Malformed("chunk size line too long".into()));
+            }
 
             let size_line = &self.chunk_buf[..size_line_end];
             let size_str = size_line
@@ -137,9 +207,15 @@ impl BodyReader {
                 if self.chunk_buf.len() < data_start + 2 {
                     break;
                 }
-                let terminator = match find(&self.chunk_buf[data_start..], b"\r\n\r\n") {
+                let trailer = &self.chunk_buf[data_start..];
+                let terminator = match find(trailer, b"\r\n\r\n") {
                     Some(pos) => data_start + pos + 4,
-                    None if self.chunk_buf[data_start..].starts_with(b"\r\n") => data_start + 2,
+                    None if trailer.starts_with(b"\r\n") => data_start + 2,
+                    None if trailer.len() > MAX_TRAILER_BYTES => {
+                        return Err(BodyError::Malformed(
+                            "chunk trailer section too large".into(),
+                        ));
+                    }
                     None => break,
                 };
                 self.trailing = self.chunk_buf.split_off(terminator);
@@ -148,19 +224,32 @@ impl BodyReader {
                 break;
             }
 
-            if self.body.len() + chunk_size > self.max_size {
+            let decoded_len = self
+                .body
+                .len()
+                .checked_add(chunk_size)
+                .ok_or(BodyError::TooLarge)?;
+            if decoded_len > self.max_size {
                 return Err(BodyError::TooLarge);
             }
 
-            let chunk_end = data_start + chunk_size;
-            if self.chunk_buf.len() < chunk_end + 2 {
+            let chunk_end = data_start.checked_add(chunk_size).ok_or_else(|| {
+                BodyError::Malformed("chunk size overflows platform limits".into())
+            })?;
+            let framed_end = chunk_end.checked_add(2).ok_or_else(|| {
+                BodyError::Malformed("chunk size overflows platform limits".into())
+            })?;
+            if self.chunk_buf.len() < framed_end {
                 break;
             }
             if &self.chunk_buf[chunk_end..chunk_end + 2] != b"\r\n" {
-                return Err(BodyError::Malformed("chunk data missing trailing CRLF".into()));
+                return Err(BodyError::Malformed(
+                    "chunk data missing trailing CRLF".into(),
+                ));
             }
 
-            self.body.extend_from_slice(&self.chunk_buf[data_start..chunk_end]);
+            self.body
+                .extend_from_slice(&self.chunk_buf[data_start..chunk_end]);
             self.chunk_buf.drain(..chunk_end + 2);
         }
 
@@ -254,5 +343,75 @@ mod tests {
         };
         let err = determine_mode(&req, 1024).unwrap_err();
         assert!(matches!(err, BodyError::Malformed(_)));
+    }
+
+    #[test]
+    fn rejects_invalid_content_length() {
+        let req = request_with_headers(vec![("content-length", "nope")]);
+        assert!(matches!(
+            determine_mode(&req, 1024),
+            Err(BodyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_content_length() {
+        let req = request_with_headers(vec![("content-length", "3"), ("content-length", "3")]);
+        assert!(matches!(
+            determine_mode(&req, 1024),
+            Err(BodyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_transfer_coding() {
+        let req = request_with_headers(vec![("transfer-encoding", "gzip, chunked")]);
+        assert!(matches!(
+            determine_mode(&req, 1024),
+            Err(BodyError::UnsupportedTransferCoding(coding)) if coding == "gzip"
+        ));
+    }
+
+    #[test]
+    fn rejects_chunked_when_it_is_not_final() {
+        let req = request_with_headers(vec![("transfer-encoding", "chunked, gzip")]);
+        assert!(matches!(
+            determine_mode(&req, 1024),
+            Err(BodyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn does_not_treat_substrings_as_chunked() {
+        let req = request_with_headers(vec![("transfer-encoding", "xchunked")]);
+        assert!(matches!(
+            determine_mode(&req, 1024),
+            Err(BodyError::UnsupportedTransferCoding(coding)) if coding == "xchunked"
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_chunk_trailers() {
+        let mut reader = BodyReader::new(Mode::Chunked, 1024);
+        let mut body = b"0\r\nX-Fill: ".to_vec();
+        body.extend(vec![b'x'; MAX_TRAILER_BYTES]);
+        assert!(matches!(reader.feed(&body), Err(BodyError::Malformed(_))));
+    }
+
+    fn request_with_headers(headers: Vec<(&str, &str)>) -> Request {
+        use crate::http::Method;
+        Request {
+            method: Method::Post,
+            raw_method: "POST".into(),
+            target: "/".into(),
+            path: "/".into(),
+            query: None,
+            version: (1, 1),
+            headers: headers
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            body: Vec::new(),
+        }
     }
 }
