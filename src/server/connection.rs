@@ -46,6 +46,10 @@ pub struct Connection {
     read_buf: Vec<u8>,
     state: State,
     last_activity: Instant,
+    /// Start of the current request phase. Unlike `last_activity`, this is
+    /// deliberately not refreshed by each byte: a slow client or CGI must
+    /// not be able to keep a request alive forever by making tiny progress.
+    state_started: Instant,
     /// Decided when a request is dispatched, applied once its response
     /// (static or CGI-produced) is actually ready to write.
     pending_keep_alive: bool,
@@ -58,6 +62,7 @@ pub struct Connection {
 
 impl Connection {
     pub fn new(fd: RawFd, stream: TcpStream, listen: Listen) -> Self {
+        let now = Instant::now();
         let peer_addr = stream
             .peer_addr()
             .map(|a| a.ip().to_string())
@@ -69,7 +74,8 @@ impl Connection {
             peer_addr,
             read_buf: Vec::new(),
             state: State::ReadingHead,
-            last_activity: Instant::now(),
+            last_activity: now,
+            state_started: now,
             pending_keep_alive: false,
             pending_for_head: false,
             pending_set_cookie: None,
@@ -82,8 +88,6 @@ impl Connection {
     /// Returns `true` when the connection is finished and should be
     /// dropped (after `cleanup` is called on it).
     pub fn on_event(&mut self, config: &Config, ctx: &mut EventCtx, event: &epoll::Event) -> bool {
-        self.last_activity = Instant::now();
-
         if event.fd == self.fd {
             // EPOLLHUP/EPOLLERR on the client socket really does mean
             // "nothing more to do here".
@@ -121,12 +125,12 @@ impl Connection {
     }
 
     pub fn is_timed_out(&self, now: Instant) -> bool {
-        let limit = match self.state {
-            State::ReadingHead if self.read_buf.is_empty() => IDLE_TIMEOUT,
-            State::RunningCgi(_) => CGI_TIMEOUT,
-            _ => REQUEST_TIMEOUT,
+        let (since, limit) = match self.state {
+            State::ReadingHead if self.read_buf.is_empty() => (self.last_activity, IDLE_TIMEOUT),
+            State::RunningCgi(_) => (self.state_started, CGI_TIMEOUT),
+            _ => (self.state_started, REQUEST_TIMEOUT),
         };
-        now.duration_since(self.last_activity) > limit
+        now.duration_since(since) > limit
     }
 
     /// Called by the main loop's sweep when `is_timed_out` fires.
@@ -167,9 +171,17 @@ impl Connection {
 
     fn read_once(&mut self, config: &Config, ctx: &mut EventCtx) -> bool {
         let mut chunk = [0u8; READ_CHUNK];
+        let starts_request = matches!(self.state, State::ReadingHead) && self.read_buf.is_empty();
         match self.stream.read(&mut chunk) {
             Ok(0) => true, // peer closed the connection
-            Ok(n) => self.feed(&chunk[..n], config, ctx),
+            Ok(n) => {
+                let now = Instant::now();
+                self.last_activity = now;
+                if starts_request {
+                    self.state_started = now;
+                }
+                self.feed(&chunk[..n], config, ctx)
+            }
             Err(e) if would_block(&e) => false,
             Err(_) => true,
         }
@@ -184,6 +196,7 @@ impl Connection {
             } => match self.stream.write(&buf[*written..]) {
                 Ok(0) => return true,
                 Ok(n) => {
+                    self.last_activity = Instant::now();
                     *written += n;
                     if *written < buf.len() {
                         return false; // more to write; wait for the next writable event
@@ -200,6 +213,7 @@ impl Connection {
             Some(true) => true,
             Some(false) => {
                 self.state = State::ReadingHead;
+                self.state_started = Instant::now();
                 let _ = ctx.epoll.modify(self.fd, epoll::READABLE);
                 if self.read_buf.is_empty() {
                     false
@@ -342,6 +356,7 @@ impl Connection {
                     ctx.pipes.insert(stdout_fd, self.fd);
                 }
                 self.state = State::RunningCgi(process);
+                self.state_started = Instant::now();
             }
             Err(_) => {
                 let resp = crate::error_page::build(Some(server), 500);
@@ -420,6 +435,7 @@ impl Connection {
             written: 0,
             close_after: !keep_alive,
         };
+        self.state_started = Instant::now();
         let _ = epoll.modify(self.fd, epoll::WRITABLE);
     }
 
