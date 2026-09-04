@@ -64,7 +64,12 @@ pub fn run(config: Config) -> std::io::Result<()> {
             let owner_fd = pipes.get(&ev.fd).copied().unwrap_or(ev.fd);
 
             let should_close = {
-                let mut ctx = EventCtx { epoll: &epoll, pipes: &mut pipes, reap: &mut reap, sessions: &mut sessions };
+                let mut ctx = EventCtx {
+                    epoll: &epoll,
+                    pipes: &mut pipes,
+                    reap: &mut reap,
+                    sessions: &mut sessions,
+                };
                 match connections.get_mut(&owner_fd) {
                     Some(conn) => guard_panic(owner_fd, || conn.on_event(&config, &mut ctx, ev)),
                     None => continue, // stale event for a connection we already dropped
@@ -73,16 +78,28 @@ pub fn run(config: Config) -> std::io::Result<()> {
 
             if should_close {
                 if let Some(mut conn) = connections.remove(&owner_fd) {
-                    let mut ctx = EventCtx { epoll: &epoll, pipes: &mut pipes, reap: &mut reap, sessions: &mut sessions };
+                    let mut ctx = EventCtx {
+                        epoll: &epoll,
+                        pipes: &mut pipes,
+                        reap: &mut reap,
+                        sessions: &mut sessions,
+                    };
                     conn.cleanup(&mut ctx);
                 }
-                epoll.remove(owner_fd);
+                remove_fd(&epoll, owner_fd);
             }
         }
 
         reap.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
         sessions.sweep_expired();
-        sweep_timeouts(&config, &epoll, &mut pipes, &mut reap, &mut sessions, &mut connections);
+        sweep_timeouts(
+            &config,
+            &epoll,
+            &mut pipes,
+            &mut reap,
+            &mut sessions,
+            &mut connections,
+        );
     }
 }
 
@@ -104,19 +121,30 @@ fn guard_panic<F: FnOnce() -> bool>(fd: RawFd, f: F) -> bool {
     }
 }
 
-fn accept_one(listen: Listen, tcp: &TcpListener, epoll: &Epoll, connections: &mut HashMap<RawFd, Connection>) {
+fn accept_one(
+    listen: Listen,
+    tcp: &TcpListener,
+    epoll: &Epoll,
+    connections: &mut HashMap<RawFd, Connection>,
+) {
     // One accept() per readiness notification, same discipline as every
     // other fd: if more connections are still queued, the listener stays
     // readable and epoll_wait reports it again on the next loop tick.
     match tcp.accept() {
         Ok((stream, _peer_addr)) => {
             if let Err(e) = stream.set_nonblocking(true) {
-                eprintln!("localhost: could not set accepted socket non-blocking: {}", e);
+                eprintln!(
+                    "localhost: could not set accepted socket non-blocking: {}",
+                    e
+                );
                 return;
             }
             let fd = stream.as_raw_fd();
             if let Err(e) = epoll.add(fd, epoll::READABLE) {
-                eprintln!("localhost: could not register accepted socket with epoll: {}", e);
+                eprintln!(
+                    "localhost: could not register accepted socket with epoll: {}",
+                    e
+                );
                 return;
             }
             connections.insert(fd, Connection::new(fd, stream, listen));
@@ -135,11 +163,20 @@ fn sweep_timeouts(
     connections: &mut HashMap<RawFd, Connection>,
 ) {
     let now = Instant::now();
-    let timed_out: Vec<RawFd> = connections.iter().filter(|(_, c)| c.is_timed_out(now)).map(|(fd, _)| *fd).collect();
+    let timed_out: Vec<RawFd> = connections
+        .iter()
+        .filter(|(_, c)| c.is_timed_out(now))
+        .map(|(fd, _)| *fd)
+        .collect();
 
     for fd in timed_out {
         let finished = {
-            let mut ctx = EventCtx { epoll, pipes, reap, sessions };
+            let mut ctx = EventCtx {
+                epoll,
+                pipes,
+                reap,
+                sessions,
+            };
             match connections.get_mut(&fd) {
                 Some(conn) => guard_panic(fd, || conn.handle_timeout(config, &mut ctx)),
                 None => true,
@@ -147,10 +184,21 @@ fn sweep_timeouts(
         };
         if finished {
             if let Some(mut conn) = connections.remove(&fd) {
-                let mut ctx = EventCtx { epoll, pipes, reap, sessions };
+                let mut ctx = EventCtx {
+                    epoll,
+                    pipes,
+                    reap,
+                    sessions,
+                };
                 conn.cleanup(&mut ctx);
             }
-            epoll.remove(fd);
+            remove_fd(epoll, fd);
         }
+    }
+}
+
+fn remove_fd(epoll: &Epoll, fd: RawFd) {
+    if let Err(e) = epoll.remove(fd) {
+        eprintln!("localhost: could not remove fd {} from epoll: {}", fd, e);
     }
 }

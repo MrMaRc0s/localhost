@@ -38,16 +38,29 @@ impl Epoll {
         self.ctl(libc::EPOLL_CTL_MOD, fd, events)
     }
 
-    /// Deregisters `fd`. Safe to call even if `fd` was already closed or
-    /// never added — both cases are reported by the kernel as `ENOENT`/`EBADF`
-    /// and simply ignored, since the caller's intent ("stop watching this
-    /// fd") is already satisfied.
-    pub fn remove(&self, fd: RawFd) {
-        let _ = unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
+    /// Deregisters `fd`. A descriptor that was already closed or removed is
+    /// considered success because the requested final state has been reached.
+    /// Other kernel errors are returned so the caller can report them instead
+    /// of silently hiding a failed epoll operation.
+    pub fn remove(&self, fd: RawFd) -> io::Result<()> {
+        let ret =
+            unsafe { libc::epoll_ctl(self.fd, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut()) };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if matches!(err.raw_os_error(), Some(code) if code == libc::ENOENT || code == libc::EBADF)
+            {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn ctl(&self, op: libc::c_int, fd: RawFd, events: u32) -> io::Result<()> {
-        let mut ev = libc::epoll_event { events, u64: fd as u64 };
+        let mut ev = libc::epoll_event {
+            events,
+            u64: fd as u64,
+        };
         let ret = unsafe { libc::epoll_ctl(self.fd, op, fd, &mut ev) };
         if ret < 0 {
             return Err(io::Error::last_os_error());
@@ -61,8 +74,10 @@ impl Epoll {
     /// connection, every listening socket, every CGI pipe — in a single
     /// process, single thread.
     pub fn wait(&self, capacity: usize, timeout_ms: i32) -> io::Result<Vec<Event>> {
-        let mut raw: Vec<libc::epoll_event> = vec![libc::epoll_event { events: 0, u64: 0 }; capacity];
-        let n = unsafe { libc::epoll_wait(self.fd, raw.as_mut_ptr(), raw.len() as i32, timeout_ms) };
+        let mut raw: Vec<libc::epoll_event> =
+            vec![libc::epoll_event { events: 0, u64: 0 }; capacity];
+        let n =
+            unsafe { libc::epoll_wait(self.fd, raw.as_mut_ptr(), raw.len() as i32, timeout_ms) };
         if n < 0 {
             let err = io::Error::last_os_error();
             // A signal interrupting the wait isn't a real error — the
@@ -108,14 +123,21 @@ mod tests {
         let events = epoll.wait(8, 20).unwrap();
         assert!(events.is_empty());
 
-        assert_eq!(unsafe { libc::write(write_fd, b"x".as_ptr() as *const _, 1) }, 1);
+        assert_eq!(
+            unsafe { libc::write(write_fd, b"x".as_ptr() as *const _, 1) },
+            1
+        );
 
         let events = epoll.wait(8, 1000).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].fd, read_fd);
         assert!(events[0].readable);
 
-        epoll.remove(read_fd);
+        epoll.remove(read_fd).unwrap();
+        // Cleanup is intentionally idempotent: a stale event may try to
+        // remove an fd that another error path already deregistered.
+        epoll.remove(read_fd).unwrap();
+        assert!(epoll.modify(read_fd, READABLE).is_err());
         unsafe {
             libc::close(read_fd);
             libc::close(write_fd);

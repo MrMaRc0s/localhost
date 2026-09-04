@@ -118,8 +118,8 @@ impl Connection {
         if is_stdin {
             self.cgi_write_once(ctx, event.fd);
         }
-        if is_stdout {
-            self.cgi_read_once(config, ctx, event.fd);
+        if is_stdout && self.cgi_read_once(config, ctx, event.fd) {
+            return true;
         }
         false
     }
@@ -146,13 +146,11 @@ impl Connection {
                     ctx.reap.push(cgi.into_child());
                 }
                 let resp = crate::error_page::build(None, 504);
-                self.begin_write(resp, false, false, ctx.epoll);
-                false
+                self.begin_write(resp, false, false, ctx.epoll)
             }
             _ => {
                 let resp = crate::error_page::build(None, 408);
-                self.begin_write(resp, false, false, ctx.epoll);
-                false
+                self.begin_write(resp, false, false, ctx.epoll)
             }
         }
     }
@@ -214,7 +212,13 @@ impl Connection {
             Some(false) => {
                 self.state = State::ReadingHead;
                 self.state_started = Instant::now();
-                let _ = ctx.epoll.modify(self.fd, epoll::READABLE);
+                if let Err(e) = ctx.epoll.modify(self.fd, epoll::READABLE) {
+                    eprintln!(
+                        "localhost: could not watch fd {} for reading: {}",
+                        self.fd, e
+                    );
+                    return true;
+                }
                 if self.read_buf.is_empty() {
                     false
                 } else {
@@ -238,11 +242,11 @@ impl Connection {
                         self.read_buf = body.take_trailing();
                         let mut request = request;
                         request.body = body.into_body();
-                        self.dispatch_and_respond(request, config, ctx);
+                        self.dispatch_and_respond(request, config, ctx)
                     } else {
                         self.state = State::ReadingBody { request, body };
+                        false
                     }
-                    false
                 }
                 Err(e) => self.fail_body_error(e, Some(&request), config, ctx),
             },
@@ -270,11 +274,11 @@ impl Connection {
                                 self.read_buf = body.take_trailing();
                                 let mut req = req;
                                 req.body = body.into_body();
-                                self.dispatch_and_respond(req, config, ctx);
+                                self.dispatch_and_respond(req, config, ctx)
                             } else {
                                 self.state = State::ReadingBody { request: req, body };
+                                false
                             }
-                            false
                         }
                         Err(e) => self.fail_body_error(e, Some(&req), config, ctx),
                     },
@@ -285,7 +289,7 @@ impl Connection {
         }
     }
 
-    fn dispatch_and_respond(&mut self, req: Request, config: &Config, ctx: &mut EventCtx) {
+    fn dispatch_and_respond(&mut self, req: Request, config: &Config, ctx: &mut EventCtx) -> bool {
         let keep_alive = req.keep_alive();
         let for_head = req.method == Method::Head;
         let host = req.header("host").map(str::to_string);
@@ -295,8 +299,7 @@ impl Connection {
             Some(s) => s,
             None => {
                 let resp = crate::error_page::build(None, 400);
-                self.begin_write(resp, false, false, ctx.epoll);
-                return;
+                return self.begin_write(resp, false, false, ctx.epoll);
             }
         };
 
@@ -322,7 +325,7 @@ impl Connection {
             Dispatch::Cgi(cgi_req) => {
                 self.pending_keep_alive = keep_alive;
                 self.pending_for_head = for_head;
-                self.start_cgi(cgi_req, &req, server, &session_id, visits, ctx);
+                self.start_cgi(cgi_req, &req, server, &session_id, visits, ctx)
             }
         }
     }
@@ -335,7 +338,7 @@ impl Connection {
         session_id: &str,
         session_visits: u64,
         ctx: &mut EventCtx,
-    ) {
+    ) -> bool {
         match cgi::spawn(
             &cgi_req,
             req,
@@ -347,27 +350,54 @@ impl Connection {
         ) {
             Ok(process) => {
                 if let Some(stdin_fd) = process.stdin_fd() {
-                    if ctx.epoll.add(stdin_fd, epoll::WRITABLE).is_ok() {
-                        ctx.pipes.insert(stdin_fd, self.fd);
+                    if let Err(e) = ctx.epoll.add(stdin_fd, epoll::WRITABLE) {
+                        return self.fail_cgi_setup(process, server, e, ctx);
                     }
+                    ctx.pipes.insert(stdin_fd, self.fd);
                 }
                 let stdout_fd = process.stdout_fd();
-                if ctx.epoll.add(stdout_fd, epoll::READABLE).is_ok() {
-                    ctx.pipes.insert(stdout_fd, self.fd);
+                if let Err(e) = ctx.epoll.add(stdout_fd, epoll::READABLE) {
+                    return self.fail_cgi_setup(process, server, e, ctx);
                 }
+                ctx.pipes.insert(stdout_fd, self.fd);
                 self.state = State::RunningCgi(process);
                 self.state_started = Instant::now();
+                false
             }
-            Err(_) => {
+            Err(e) => {
+                eprintln!("localhost: could not start CGI: {}", e);
                 let resp = crate::error_page::build(Some(server), 500);
                 self.begin_write(
                     resp,
                     self.pending_keep_alive,
                     self.pending_for_head,
                     ctx.epoll,
-                );
+                )
             }
         }
+    }
+
+    fn fail_cgi_setup(
+        &mut self,
+        mut process: CgiProcess,
+        server: &crate::config::ServerConfig,
+        error: std::io::Error,
+        ctx: &mut EventCtx,
+    ) -> bool {
+        eprintln!(
+            "localhost: could not register CGI pipe with epoll: {}",
+            error
+        );
+        deregister_cgi(&mut process, ctx);
+        process.kill();
+        ctx.reap.push(process.into_child());
+        let resp = crate::error_page::build(Some(server), 500);
+        self.begin_write(
+            resp,
+            self.pending_keep_alive,
+            self.pending_for_head,
+            ctx.epoll,
+        )
     }
 
     fn cgi_write_once(&mut self, ctx: &mut EventCtx, fd: RawFd) {
@@ -377,31 +407,31 @@ impl Connection {
         match cgi.write_stdin_once() {
             WriteOutcome::Pending => {}
             WriteOutcome::Done | WriteOutcome::Error => {
-                ctx.epoll.remove(fd);
+                remove_from_epoll(ctx.epoll, fd);
                 ctx.pipes.remove(&fd);
             }
         }
     }
 
-    fn cgi_read_once(&mut self, config: &Config, ctx: &mut EventCtx, fd: RawFd) {
+    fn cgi_read_once(&mut self, config: &Config, ctx: &mut EventCtx, fd: RawFd) -> bool {
         let State::RunningCgi(cgi) = &mut self.state else {
-            return;
+            return false;
         };
         match cgi.read_stdout_once() {
-            ReadOutcome::Pending => {}
+            ReadOutcome::Pending => false,
             ReadOutcome::Eof | ReadOutcome::Error => {
-                ctx.epoll.remove(fd);
+                remove_from_epoll(ctx.epoll, fd);
                 ctx.pipes.remove(&fd);
-                self.finish_cgi(config, ctx);
+                self.finish_cgi(config, ctx)
             }
         }
     }
 
-    fn finish_cgi(&mut self, _config: &Config, ctx: &mut EventCtx) {
+    fn finish_cgi(&mut self, _config: &Config, ctx: &mut EventCtx) -> bool {
         let state = std::mem::replace(&mut self.state, State::ReadingHead);
         let State::RunningCgi(mut cgi) = state else {
             self.state = state;
-            return;
+            return false;
         };
 
         deregister_cgi(&mut cgi, ctx);
@@ -421,10 +451,19 @@ impl Connection {
             self.pending_keep_alive,
             self.pending_for_head,
             ctx.epoll,
-        );
+        )
     }
 
-    fn begin_write(&mut self, response: Response, keep_alive: bool, for_head: bool, epoll: &Epoll) {
+    /// Switches the client socket to writable interest. A failed transition
+    /// is fatal for this connection: keeping it in the previous epoll state
+    /// would leave a response queued forever with no writable notification.
+    fn begin_write(
+        &mut self,
+        response: Response,
+        keep_alive: bool,
+        for_head: bool,
+        epoll: &Epoll,
+    ) -> bool {
         let response = match self.pending_set_cookie.take() {
             Some(cookie) => response.header("Set-Cookie", cookie),
             None => response,
@@ -436,7 +475,14 @@ impl Connection {
             close_after: !keep_alive,
         };
         self.state_started = Instant::now();
-        let _ = epoll.modify(self.fd, epoll::WRITABLE);
+        if let Err(e) = epoll.modify(self.fd, epoll::WRITABLE) {
+            eprintln!(
+                "localhost: could not watch fd {} for writing: {}",
+                self.fd, e
+            );
+            return true;
+        }
+        false
     }
 
     fn fail_body_error(
@@ -465,8 +511,7 @@ impl Connection {
         };
         let server = config.resolve(self.listen, req.and_then(|r| r.header("host")));
         let resp = crate::error_page::build(server, code);
-        self.begin_write(resp, false, false, ctx.epoll);
-        false
+        self.begin_write(resp, false, false, ctx.epoll)
     }
 
     fn fail_parse_error(&mut self, err: ParseError, ctx: &mut EventCtx) -> bool {
@@ -480,19 +525,24 @@ impl Connection {
             }
         };
         let resp = crate::error_page::build(None, code);
-        self.begin_write(resp, false, false, ctx.epoll);
-        false
+        self.begin_write(resp, false, false, ctx.epoll)
     }
 }
 
 fn deregister_cgi(cgi: &mut CgiProcess, ctx: &mut EventCtx) {
     if let Some(fd) = cgi.stdin_fd() {
-        ctx.epoll.remove(fd);
+        remove_from_epoll(ctx.epoll, fd);
         ctx.pipes.remove(&fd);
     }
     let stdout_fd = cgi.stdout_fd();
-    ctx.epoll.remove(stdout_fd);
+    remove_from_epoll(ctx.epoll, stdout_fd);
     ctx.pipes.remove(&stdout_fd);
+}
+
+fn remove_from_epoll(epoll: &Epoll, fd: RawFd) {
+    if let Err(e) = epoll.remove(fd) {
+        eprintln!("localhost: could not remove fd {} from epoll: {}", fd, e);
+    }
 }
 
 fn would_block(e: &std::io::Error) -> bool {
