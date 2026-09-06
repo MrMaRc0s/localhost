@@ -1,3 +1,7 @@
+use std::fmt;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,24 +13,52 @@ pub struct UploadedFile {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug)]
+pub enum UploadError {
+    BadRequest(String),
+    Forbidden(String),
+    Io(String),
+}
+
+impl fmt::Display for UploadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::BadRequest(message) | Self::Forbidden(message) | Self::Io(message) => message,
+        };
+        f.write_str(message)
+    }
+}
+
 /// Saves a POST body into `store_dir`, understanding both a browser's
 /// `multipart/form-data` file input and a plain `curl --data-binary`
-/// style upload. Returns the list of files actually written to disk, or
-/// `Err(message)` if nothing usable could be extracted from the body.
-pub fn save(store_dir: &str, remainder: &str, req: &Request) -> Result<Vec<String>, String> {
-    std::fs::create_dir_all(store_dir).map_err(|e| format!("could not create upload directory: {}", e))?;
+/// style upload. Returns the list of files actually written to disk and
+/// classifies failures so the router can choose the correct HTTP status.
+pub fn save(store_dir: &str, remainder: &str, req: &Request) -> Result<Vec<String>, UploadError> {
+    std::fs::create_dir_all(store_dir)
+        .map_err(|error| classify_io_error("could not create upload directory", error))?;
 
     let content_type = req.header("content-type").unwrap_or("");
-    if content_type.to_ascii_lowercase().starts_with("multipart/form-data") {
-        let files = parse_multipart(content_type, &req.body).ok_or("malformed multipart/form-data body")?;
+    if content_type
+        .to_ascii_lowercase()
+        .starts_with("multipart/form-data")
+    {
+        let files = parse_multipart(content_type, &req.body).ok_or_else(|| {
+            UploadError::BadRequest("malformed multipart/form-data body".to_string())
+        })?;
         if files.is_empty() {
-            return Err("multipart body contained no file part".to_string());
+            return Err(UploadError::BadRequest(
+                "multipart body contained no file part".to_string(),
+            ));
         }
         let mut saved = Vec::new();
         for file in files {
             let name = sanitize_filename(&file.filename);
-            let dest = safe_join(store_dir, &name).ok_or("invalid filename")?;
-            std::fs::write(&dest, &file.data).map_err(|e| e.to_string())?;
+            let dest = safe_join(store_dir, &name).ok_or_else(|| {
+                UploadError::Forbidden(
+                    "upload destination escapes its configured directory".to_string(),
+                )
+            })?;
+            write_upload(&dest, &file.data)?;
             saved.push(name);
         }
         Ok(saved)
@@ -36,14 +68,49 @@ pub fn save(store_dir: &str, remainder: &str, req: &Request) -> Result<Vec<Strin
             .find(|s| !s.is_empty())
             .map(sanitize_filename)
             .unwrap_or_else(generated_filename);
-        let dest = safe_join(store_dir, &name).ok_or("invalid filename")?;
-        std::fs::write(&dest, &req.body).map_err(|e| e.to_string())?;
+        let dest = safe_join(store_dir, &name).ok_or_else(|| {
+            UploadError::Forbidden(
+                "upload destination escapes its configured directory".to_string(),
+            )
+        })?;
+        write_upload(&dest, &req.body)?;
         Ok(vec![name])
     }
 }
 
+fn write_upload(path: &Path, contents: &[u8]) -> Result<(), UploadError> {
+    // safe_join checks the path as it exists now. O_NOFOLLOW closes the
+    // final-component symlink race between that check and opening the file.
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| classify_io_error("could not open upload destination", error))?;
+
+    file.write_all(contents)
+        .map_err(|error| classify_io_error("could not write upload", error))
+}
+
+fn classify_io_error(context: &str, error: io::Error) -> UploadError {
+    let message = format!("{}: {}", context, error);
+    let raw_error = error.raw_os_error();
+    if error.kind() == io::ErrorKind::PermissionDenied
+        || raw_error == Some(libc::ELOOP)
+        || raw_error == Some(libc::EISDIR)
+    {
+        UploadError::Forbidden(message)
+    } else {
+        UploadError::Io(message)
+    }
+}
+
 fn generated_filename() -> String {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
     format!("upload-{}.bin", nanos)
 }
 
@@ -52,7 +119,10 @@ fn generated_filename() -> String {
 /// browsers send the full client-side path) can never escape the upload
 /// directory.
 fn sanitize_filename(raw: &str) -> String {
-    let base = Path::new(raw).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let base = Path::new(raw)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
     if base.is_empty() || base == "." || base == ".." {
         generated_filename()
     } else {
@@ -80,7 +150,10 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Option<Vec<UploadedFile>>
 
         let filename = header_block
             .split("\r\n")
-            .find(|line| line.to_ascii_lowercase().starts_with("content-disposition:"))
+            .find(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("content-disposition:")
+            })
             .and_then(|line| extract_quoted(line, "filename"));
 
         let data_start = header_end + 4;
@@ -92,7 +165,10 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Option<Vec<UploadedFile>>
         };
 
         if let Some(filename) = filename.filter(|f| !f.is_empty()) {
-            files.push(UploadedFile { filename, data: body[data_start..data_end].to_vec() });
+            files.push(UploadedFile {
+                filename,
+                data: body[data_start..data_end].to_vec(),
+            });
         }
 
         cursor = next_delim + delimiter.len();
@@ -154,6 +230,7 @@ pub fn store_dir_for(route_store: Option<&str>, base_dir: &str) -> PathBuf {
 mod tests {
     use super::*;
     use crate::http::Method;
+    use std::os::unix::fs::symlink;
 
     fn multipart_body(boundary: &str, filename: &str, contents: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();
@@ -187,9 +264,13 @@ mod tests {
     fn saves_multipart_file_uncorrupted() {
         let boundary = "----boundaryXYZ";
         let contents = b"the quick brown fox";
-        let req = req_with(multipart_body(boundary, "photo.txt", contents), &format!("multipart/form-data; boundary={}", boundary));
+        let req = req_with(
+            multipart_body(boundary, "photo.txt", contents),
+            &format!("multipart/form-data; boundary={}", boundary),
+        );
 
-        let dir = std::env::temp_dir().join(format!("localhost-upload-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("localhost-upload-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let saved = save(dir.to_str().unwrap(), "", &req).unwrap();
@@ -203,12 +284,16 @@ mod tests {
     #[test]
     fn saves_raw_body_using_url_filename() {
         let req = req_with(b"hello raw upload".to_vec(), "text/plain");
-        let dir = std::env::temp_dir().join(format!("localhost-upload-test-raw-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("localhost-upload-test-raw-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let saved = save(dir.to_str().unwrap(), "/note.txt", &req).unwrap();
         assert_eq!(saved, vec!["note.txt".to_string()]);
-        assert_eq!(std::fs::read(dir.join("note.txt")).unwrap(), b"hello raw upload");
+        assert_eq!(
+            std::fs::read(dir.join("note.txt")).unwrap(),
+            b"hello raw upload"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -220,7 +305,8 @@ mod tests {
             multipart_body(boundary, "../../etc/passwd", b"pwned"),
             &format!("multipart/form-data; boundary={}", boundary),
         );
-        let dir = std::env::temp_dir().join(format!("localhost-upload-test-trav-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("localhost-upload-test-trav-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
         let saved = save(dir.to_str().unwrap(), "", &req).unwrap();
@@ -232,6 +318,29 @@ mod tests {
     }
 
     #[test]
+    fn refuses_to_overwrite_file_through_symlink() {
+        let req = req_with(b"replacement".to_vec(), "text/plain");
+        let dir =
+            std::env::temp_dir().join(format!("localhost-upload-test-link-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!(
+            "localhost-upload-test-outside-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&outside);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&outside, b"keep me").unwrap();
+        symlink(&outside, dir.join("note.txt")).unwrap();
+
+        let result = save(dir.to_str().unwrap(), "/note.txt", &req);
+        assert!(matches!(result, Err(UploadError::Forbidden(_))));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep me");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_file(outside).unwrap();
+    }
+
+    #[test]
     fn delete_reports_not_found_for_missing_file() {
         let path = std::env::temp_dir().join("localhost-does-not-exist-xyz");
         assert!(matches!(delete(&path), DeleteOutcome::NotFound));
@@ -239,7 +348,8 @@ mod tests {
 
     #[test]
     fn delete_removes_existing_file() {
-        let path = std::env::temp_dir().join(format!("localhost-delete-test-{}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("localhost-delete-test-{}", std::process::id()));
         std::fs::write(&path, b"bye").unwrap();
         assert!(matches!(delete(&path), DeleteOutcome::Deleted));
         assert!(!path.exists());
