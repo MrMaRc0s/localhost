@@ -1,6 +1,7 @@
 use super::error::ConfigError;
 use super::types::{Config, Listen, RouteConfig, ServerConfig};
 use crate::http::Method;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::str::FromStr;
 
@@ -184,7 +185,14 @@ impl<'a> Parser<'a> {
                     }
                 }
                 "server_name" => {
-                    server.server_names.extend(self.until_semicolon()?);
+                    let names = self.until_semicolon()?;
+                    if names.is_empty() {
+                        return Err(ConfigError::new(format!(
+                            "line {}: `server_name` expects at least one name",
+                            line
+                        )));
+                    }
+                    server.server_names.extend(names);
                 }
                 "root" => {
                     server.root = self.single_value("root", line)?;
@@ -210,6 +218,18 @@ impl<'a> Parser<'a> {
                         let code: u16 = code.parse().map_err(|_| {
                             ConfigError::new(format!("line {}: invalid status code `{}`", line, code))
                         })?;
+                        if !(400..=599).contains(&code) {
+                            return Err(ConfigError::new(format!(
+                                "line {}: `error_page` status must be between 400 and 599, found {}",
+                                line, code
+                            )));
+                        }
+                        if server.error_pages.contains_key(&code) {
+                            return Err(ConfigError::new(format!(
+                                "line {}: duplicate `error_page` mapping for status {}",
+                                line, code
+                            )));
+                        }
                         server.error_pages.insert(code, path.clone());
                     }
                 }
@@ -249,6 +269,7 @@ impl<'a> Parser<'a> {
             match directive.as_str() {
                 "methods" => {
                     let mut methods = Vec::new();
+                    let mut seen = HashSet::new();
                     for word in self.until_semicolon()? {
                         let method = Method::parse(&word);
                         if method == Method::Other {
@@ -257,7 +278,19 @@ impl<'a> Parser<'a> {
                                 line, word
                             )));
                         }
+                        if !seen.insert(method) {
+                            return Err(ConfigError::new(format!(
+                                "line {}: duplicate HTTP method `{}`",
+                                line, word
+                            )));
+                        }
                         methods.push(method);
+                    }
+                    if methods.is_empty() {
+                        return Err(ConfigError::new(format!(
+                            "line {}: `methods` expects at least one HTTP method",
+                            line
+                        )));
                     }
                     route.methods = methods;
                     methods_set = true;
@@ -288,6 +321,12 @@ impl<'a> Parser<'a> {
                     let code: u16 = values[0].parse().map_err(|_| {
                         ConfigError::new(format!("line {}: invalid redirect status `{}`", line, values[0]))
                     })?;
+                    if !(300..=399).contains(&code) {
+                        return Err(ConfigError::new(format!(
+                            "line {}: `return` status must be between 300 and 399, found {}",
+                            line, code
+                        )));
+                    }
                     route.redirect = Some((code, values[1].clone()));
                 }
                 "cgi" => {
@@ -298,7 +337,19 @@ impl<'a> Parser<'a> {
                             line
                         )));
                     }
-                    route.cgi.insert(values[0].clone(), values[1].clone());
+                    let extension = &values[0];
+                    if !extension.starts_with('.') || extension.len() == 1 || extension.contains('/') {
+                        return Err(ConfigError::new(format!(
+                            "line {}: CGI extension `{}` must look like `.py`",
+                            line, extension
+                        )));
+                    }
+                    if route.cgi.insert(extension.clone(), values[1].clone()).is_some() {
+                        return Err(ConfigError::new(format!(
+                            "line {}: duplicate CGI mapping for extension `{}`",
+                            line, extension
+                        )));
+                    }
                 }
                 "upload_store" => {
                     route.upload_store = Some(self.single_value("upload_store", line)?);
@@ -332,11 +383,23 @@ fn parse_listen(value: &str, line: usize) -> Result<Listen, ConfigError> {
         let port: u16 = port
             .parse()
             .map_err(|_| ConfigError::new(format!("line {}: invalid port `{}`", line, port)))?;
+        if port == 0 {
+            return Err(ConfigError::new(format!(
+                "line {}: port 0 is not a usable configured listener",
+                line
+            )));
+        }
         Ok(Listen { host, port })
     } else {
         let port: u16 = value
             .parse()
             .map_err(|_| ConfigError::new(format!("line {}: invalid `listen` value `{}`", line, value)))?;
+        if port == 0 {
+            return Err(ConfigError::new(format!(
+                "line {}: port 0 is not a usable configured listener",
+                line
+            )));
+        }
         Ok(Listen { host: IpAddr::from_str("0.0.0.0").unwrap(), port })
     }
 }
@@ -355,7 +418,8 @@ fn parse_size(value: &str, line: usize) -> Result<usize, ConfigError> {
     let base: usize = digits
         .parse()
         .map_err(|_| ConfigError::new(format!("line {}: invalid size `{}`", line, value)))?;
-    Ok(base * multiplier)
+    base.checked_mul(multiplier)
+        .ok_or_else(|| ConfigError::new(format!("line {}: size `{}` is too large", line, value)))
 }
 
 #[cfg(test)]
@@ -408,5 +472,103 @@ mod tests {
         let src = "server { listen 8080; server_name a.test; route / { methods GET; } } \
                    server { listen 8080; server_name b.test; route / { methods GET; } }";
         assert!(parse_str(src).is_ok());
+    }
+
+    #[test]
+    fn rejects_port_zero() {
+        assert_error_contains(
+            "server { listen 0; route / { methods GET; } }",
+            "port 0",
+        );
+    }
+
+    #[test]
+    fn rejects_overflowing_body_size() {
+        let src = format!(
+            "server {{ listen 8080; client_max_body_size {}m; route / {{ methods GET; }} }}",
+            usize::MAX
+        );
+        assert_error_contains(&src, "too large");
+    }
+
+    #[test]
+    fn rejects_relative_and_duplicate_routes() {
+        assert_error_contains(
+            "server { listen 8080; route files { methods GET; } }",
+            "must start with `/`",
+        );
+        assert_error_contains(
+            "server { listen 8080; route /files { methods GET; } route /files { methods POST; } }",
+            "duplicate route",
+        );
+    }
+
+    #[test]
+    fn rejects_empty_and_duplicate_method_lists() {
+        assert_error_contains(
+            "server { listen 8080; route / { methods; } }",
+            "at least one HTTP method",
+        );
+        assert_error_contains(
+            "server { listen 8080; route / { methods GET GET; } }",
+            "duplicate HTTP method",
+        );
+    }
+
+    #[test]
+    fn rejects_non_redirect_return_status() {
+        assert_error_contains(
+            "server { listen 8080; route / { return 200 /elsewhere; } }",
+            "between 300 and 399",
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_cgi_extensions() {
+        assert_error_contains(
+            "server { listen 8080; route / { cgi py python3; } }",
+            "must look like `.py`",
+        );
+        assert_error_contains(
+            "server { listen 8080; route / { cgi .py python3; cgi .py other-python; } }",
+            "duplicate CGI mapping",
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_error_page_codes() {
+        assert_error_contains(
+            "server { listen 8080; error_page 200 /error.html; route / { methods GET; } }",
+            "between 400 and 599",
+        );
+        assert_error_contains(
+            "server { listen 8080; error_page 404 /first.html; error_page 404 /second.html; route / { methods GET; } }",
+            "duplicate `error_page`",
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_server_names() {
+        assert_error_contains(
+            "server { listen 8080; server_name example.test EXAMPLE.test; route / { methods GET; } }",
+            "duplicate server_name",
+        );
+    }
+
+    #[test]
+    fn rejects_overlapping_wildcard_and_concrete_listeners() {
+        let src = "server { listen 8080; server_name wildcard.test; route / { methods GET; } } \
+                   server { listen 127.0.0.1:8080; server_name loopback.test; route / { methods GET; } }";
+        assert_error_contains(src, "overlap");
+    }
+
+    fn assert_error_contains(src: &str, expected: &str) {
+        let error = parse_str(src).expect_err("configuration should be rejected");
+        assert!(
+            error.0.contains(expected),
+            "expected `{}` in configuration error `{}`",
+            expected,
+            error.0
+        );
     }
 }
