@@ -38,10 +38,8 @@ pub fn save(store_dir: &str, remainder: &str, req: &Request) -> Result<Vec<Strin
         .map_err(|error| classify_io_error("could not create upload directory", error))?;
 
     let content_type = req.header("content-type").unwrap_or("");
-    if content_type
-        .to_ascii_lowercase()
-        .starts_with("multipart/form-data")
-    {
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    if media_type.eq_ignore_ascii_case("multipart/form-data") {
         let files = parse_multipart(content_type, &req.body).ok_or_else(|| {
             UploadError::BadRequest("malformed multipart/form-data body".to_string())
         })?;
@@ -119,11 +117,8 @@ fn generated_filename() -> String {
 /// browsers send the full client-side path) can never escape the upload
 /// directory.
 fn sanitize_filename(raw: &str) -> String {
-    let base = Path::new(raw)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    if base.is_empty() || base == "." || base == ".." {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    if base.is_empty() || base == "." || base == ".." || base.chars().any(char::is_control) {
         generated_filename()
     } else {
         base.to_string()
@@ -135,64 +130,156 @@ fn parse_multipart(content_type: &str, body: &[u8]) -> Option<Vec<UploadedFile>>
     let delimiter = format!("--{}", boundary).into_bytes();
 
     let mut files = Vec::new();
-    let mut cursor = find_bytes(body, &delimiter)? + delimiter.len();
+    let mut cursor = find_delimiter(body, &delimiter, 0)?;
 
     loop {
+        cursor += delimiter.len();
         if body.get(cursor..cursor + 2) == Some(b"--") {
-            break;
+            let after_close = cursor + 2;
+            if after_close == body.len() || body.get(after_close..after_close + 2) == Some(b"\r\n")
+            {
+                return Some(files);
+            }
+            return None;
         }
-        if body.get(cursor..cursor + 2) == Some(b"\r\n") {
-            cursor += 2;
+        if body.get(cursor..cursor + 2) != Some(b"\r\n") {
+            return None;
         }
+        cursor += 2;
 
         let header_end = find_bytes(&body[cursor..], b"\r\n\r\n")? + cursor;
+        if header_end - cursor > 16 * 1024 {
+            return None;
+        }
         let header_block = std::str::from_utf8(&body[cursor..header_end]).ok()?;
 
         let filename = header_block
             .split("\r\n")
-            .find(|line| {
-                line.to_ascii_lowercase()
-                    .starts_with("content-disposition:")
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-disposition") {
+                    extract_parameter(value, "filename")
+                } else {
+                    None
+                }
             })
-            .and_then(|line| extract_quoted(line, "filename"));
+            .filter(|name| !name.is_empty());
 
         let data_start = header_end + 4;
-        let next_delim = find_bytes(&body[data_start..], &delimiter)? + data_start;
-        let data_end = if next_delim >= 2 && &body[next_delim - 2..next_delim] == b"\r\n" {
-            next_delim - 2
-        } else {
-            next_delim
-        };
+        let next_delim = find_delimiter(body, &delimiter, data_start)?;
+        if next_delim < 2 || body.get(next_delim - 2..next_delim) != Some(b"\r\n") {
+            return None;
+        }
+        let data_end = next_delim - 2;
 
-        if let Some(filename) = filename.filter(|f| !f.is_empty()) {
+        if let Some(filename) = filename {
             files.push(UploadedFile {
                 filename,
                 data: body[data_start..data_end].to_vec(),
             });
         }
 
-        cursor = next_delim + delimiter.len();
-        if body.get(cursor..cursor + 2) == Some(b"--") {
-            break;
-        }
+        cursor = next_delim;
     }
-
-    Some(files)
 }
 
 fn extract_boundary(content_type: &str) -> Option<String> {
-    content_type
-        .split(';')
-        .map(str::trim)
-        .find_map(|p| p.strip_prefix("boundary="))
-        .map(|b| b.trim_matches('"').to_string())
+    let boundary = extract_parameter(content_type, "boundary")?;
+    let bytes = boundary.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 70
+        && bytes.last() != Some(&b' ')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"'()+_,-./:=? ".contains(byte));
+    valid.then_some(boundary)
 }
 
-fn extract_quoted(line: &str, key: &str) -> Option<String> {
-    let needle = format!("{}=\"", key);
-    let start = line.find(&needle)? + needle.len();
-    let end = line[start..].find('"')? + start;
-    Some(line[start..end].to_string())
+fn extract_parameter(value: &str, wanted: &str) -> Option<String> {
+    for field in split_parameter_fields(value)? {
+        let Some((name, raw_value)) = field.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case(wanted) {
+            return decode_parameter_value(raw_value.trim());
+        }
+    }
+    None
+}
+
+/// Splits a MIME-style parameter list without treating semicolons inside
+/// quoted values (for example `filename="quarter;final.txt"`) as separators.
+fn split_parameter_fields(value: &str) -> Option<Vec<&str>> {
+    let mut fields = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+
+    for (index, character) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ';' if !quoted => {
+                fields.push(&value[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted || escaped {
+        return None;
+    }
+    fields.push(&value[start..]);
+    Some(fields)
+}
+
+fn decode_parameter_value(raw: &str) -> Option<String> {
+    if !raw.starts_with('"') {
+        return (!raw.is_empty() && !raw.contains('"')).then(|| raw.to_string());
+    }
+    let inner = raw.strip_prefix('"')?.strip_suffix('"')?;
+    let mut decoded = String::new();
+    let mut characters = inner.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            let escaped = characters.next()?;
+            if escaped == '\\' || escaped == '"' {
+                decoded.push(escaped);
+            } else {
+                // Browsers have historically sent Windows paths using
+                // literal backslashes rather than MIME quoted-pairs.
+                decoded.push('\\');
+                decoded.push(escaped);
+            }
+        } else {
+            decoded.push(character);
+        }
+    }
+    Some(decoded)
+}
+
+fn find_delimiter(body: &[u8], delimiter: &[u8], start: usize) -> Option<usize> {
+    let mut search_from = start;
+    while search_from <= body.len() {
+        let relative = find_bytes(body.get(search_from..)?, delimiter)?;
+        let position = search_from + relative;
+        let line_start =
+            position == 0 || (position >= 2 && body.get(position - 2..position) == Some(b"\r\n"));
+        let after = position.checked_add(delimiter.len())?;
+        let regular = body.get(after..after + 2) == Some(b"\r\n");
+        let closing = body.get(after..after + 2) == Some(b"--")
+            && (after + 2 == body.len() || body.get(after + 2..after + 4) == Some(b"\r\n"));
+        let valid_end = regular || closing;
+        if line_start && valid_end {
+            return Some(position);
+        }
+        search_from = position.checked_add(1)?;
+    }
+    None
 }
 
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -315,6 +402,60 @@ mod tests {
         assert!(dir.join("passwd").exists());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn preserves_boundary_like_bytes_inside_file() {
+        let boundary = "----inside-check";
+        let contents = b"before--inside-check-after\r\n------inside-check-not-a-delimiter";
+        let body = multipart_body(boundary, "payload.bin", contents);
+
+        let files = parse_multipart(
+            &format!("multipart/form-data; boundary={}", boundary),
+            &body,
+        )
+        .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].data, contents);
+    }
+
+    #[test]
+    fn handles_quoted_case_insensitive_boundary_and_windows_filename() {
+        let boundary = "BrowserBoundary";
+        let req = req_with(
+            multipart_body(boundary, r"C:\fakepath\quarter;final.txt", b"report"),
+            &format!("Multipart/Form-Data; BOUNDARY=\"{}\"", boundary),
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "localhost-upload-test-windows-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let saved = save(dir.to_str().unwrap(), "", &req).unwrap();
+
+        assert_eq!(saved, vec!["quarter;final.txt".to_string()]);
+        assert_eq!(
+            std::fs::read(dir.join("quarter;final.txt")).unwrap(),
+            b"report"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_missing_closing_delimiter() {
+        let body = b"--unfinished\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\ndata";
+        assert!(parse_multipart("multipart/form-data; boundary=unfinished", body).is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_boundaries() {
+        assert!(extract_boundary("multipart/form-data; boundary=").is_none());
+        assert!(extract_boundary("multipart/form-data; boundary=has@invalid").is_none());
+        let too_long = "a".repeat(71);
+        assert!(extract_boundary(&format!("multipart/form-data; boundary={too_long}")).is_none());
+        assert!(parse_multipart("multipart/form-data; boundary=b", b"x--b--").is_none());
     }
 
     #[test]
