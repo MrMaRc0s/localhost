@@ -419,12 +419,40 @@ impl Connection {
         };
         match cgi.read_stdout_once() {
             ReadOutcome::Pending => false,
-            ReadOutcome::Eof | ReadOutcome::Error => {
+            ReadOutcome::Eof => {
                 remove_from_epoll(ctx.epoll, fd);
                 ctx.pipes.remove(&fd);
                 self.finish_cgi(config, ctx)
             }
+            ReadOutcome::TooLarge => {
+                eprintln!("localhost: fd {}: CGI output exceeded the limit", self.fd);
+                self.fail_running_cgi(ctx)
+            }
+            ReadOutcome::Error => {
+                eprintln!("localhost: fd {}: could not read CGI output", self.fd);
+                self.fail_running_cgi(ctx)
+            }
         }
+    }
+
+    fn fail_running_cgi(&mut self, ctx: &mut EventCtx) -> bool {
+        let state = std::mem::replace(&mut self.state, State::ReadingHead);
+        let State::RunningCgi(mut cgi) = state else {
+            self.state = state;
+            return false;
+        };
+
+        deregister_cgi(&mut cgi, ctx);
+        cgi.kill();
+        ctx.reap.push(cgi.into_child());
+
+        let response = crate::error_page::build(None, 502);
+        self.begin_write(
+            response,
+            self.pending_keep_alive,
+            self.pending_for_head,
+            ctx.epoll,
+        )
     }
 
     fn finish_cgi(&mut self, _config: &Config, ctx: &mut EventCtx) -> bool {

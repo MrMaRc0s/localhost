@@ -6,6 +6,10 @@ use crate::config::{Listen, ServerConfig};
 use crate::http::{Request, Response};
 use crate::router::CgiRequest;
 
+/// CGI is an external program and cannot be trusted to stop producing
+/// output. Keep one runaway child from consuming all server memory.
+const MAX_CGI_OUTPUT: usize = 8 * 1024 * 1024;
+
 /// A running CGI child process together with the request body still
 /// waiting to be written to its stdin and whatever it has produced on
 /// stdout so far. Every read/write against `stdin`/`stdout` here is a
@@ -29,6 +33,7 @@ pub enum WriteOutcome {
 pub enum ReadOutcome {
     Pending,
     Eof,
+    TooLarge,
     Error,
 }
 
@@ -73,8 +78,11 @@ impl CgiProcess {
         match self.stdout.read(&mut chunk) {
             Ok(0) => ReadOutcome::Eof,
             Ok(n) => {
-                self.output.extend_from_slice(&chunk[..n]);
-                ReadOutcome::Pending
+                if append_output(&mut self.output, &chunk[..n]) {
+                    ReadOutcome::Pending
+                } else {
+                    ReadOutcome::TooLarge
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => ReadOutcome::Pending,
             Err(_) => ReadOutcome::Error,
@@ -98,6 +106,17 @@ impl CgiProcess {
     pub fn into_child(self) -> Child {
         self.child
     }
+}
+
+fn append_output(output: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let Some(new_len) = output.len().checked_add(chunk.len()) else {
+        return false;
+    };
+    if new_len > MAX_CGI_OUTPUT {
+        return false;
+    }
+    output.extend_from_slice(chunk);
+    true
 }
 
 pub fn spawn(
@@ -315,5 +334,14 @@ mod tests {
         let resp = parse_output(raw);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, raw);
+    }
+
+    #[test]
+    fn cgi_output_is_bounded() {
+        let mut output = vec![b'a'; MAX_CGI_OUTPUT - 1];
+        assert!(append_output(&mut output, b"b"));
+        assert_eq!(output.len(), MAX_CGI_OUTPUT);
+        assert!(!append_output(&mut output, b"c"));
+        assert_eq!(output.len(), MAX_CGI_OUTPUT);
     }
 }
