@@ -298,10 +298,13 @@ pub enum DeleteOutcome {
 
 pub fn delete(fs_path: &Path) -> DeleteOutcome {
     match std::fs::metadata(fs_path) {
-        Err(_) => DeleteOutcome::NotFound,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DeleteOutcome::NotFound,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => DeleteOutcome::Forbidden,
+        Err(e) => DeleteOutcome::Error(e.to_string()),
         Ok(meta) if meta.is_dir() => DeleteOutcome::Forbidden,
         Ok(_) => match std::fs::remove_file(fs_path) {
             Ok(()) => DeleteOutcome::Deleted,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DeleteOutcome::NotFound,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => DeleteOutcome::Forbidden,
             Err(e) => DeleteOutcome::Error(e.to_string()),
         },

@@ -292,6 +292,12 @@ impl<'a> Parser<'a> {
                             line
                         )));
                     }
+                    // HEAD has the same representation as GET without the
+                    // response body. HTTP/1.1 general-purpose servers are
+                    // expected to support both, so configuring GET implies it.
+                    if methods.contains(&Method::Get) && !methods.contains(&Method::Head) {
+                        methods.push(Method::Head);
+                    }
                     route.methods = methods;
                     methods_set = true;
                 }
@@ -513,6 +519,14 @@ mod tests {
             "server { listen 8080; route / { methods GET GET; } }",
             "duplicate HTTP method",
         );
+    }
+
+    #[test]
+    fn configuring_get_also_enables_head() {
+        let config = parse_str("server { listen 8080; route / { methods GET; } }").unwrap();
+        let methods = &config.servers[0].routes[0].methods;
+        assert!(methods.contains(&Method::Get));
+        assert!(methods.contains(&Method::Head));
     }
 
     #[test]

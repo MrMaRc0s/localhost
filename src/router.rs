@@ -32,10 +32,6 @@ pub fn dispatch(server: &ServerConfig, req: &Request) -> Dispatch {
         None => return Dispatch::Response(super::error_page::build(Some(server), 404)),
     };
 
-    if let Some((code, target)) = &route.redirect {
-        return Dispatch::Response(Response::redirect(*code, target));
-    }
-
     if !route.allows(req.method) {
         let allow = route
             .methods
@@ -45,6 +41,10 @@ pub fn dispatch(server: &ServerConfig, req: &Request) -> Dispatch {
             .join(", ");
         let resp = super::error_page::build(Some(server), 405).header("Allow", allow);
         return Dispatch::Response(resp);
+    }
+
+    if let Some((code, target)) = &route.redirect {
+        return Dispatch::Response(Response::redirect(*code, target));
     }
 
     let base_dir = route.root.as_deref().unwrap_or(&server.root);
@@ -195,7 +195,14 @@ fn resolve_path(
 ) -> Dispatch {
     let meta = match std::fs::metadata(fs_path) {
         Ok(m) => m,
-        Err(_) => return Dispatch::Response(super::error_page::build(Some(server), 404)),
+        Err(error) => {
+            return Dispatch::Response(filesystem_error_response(
+                server,
+                "inspect",
+                fs_path,
+                error,
+            ))
+        }
     };
 
     if meta.is_dir() {
@@ -205,12 +212,24 @@ fn resolve_path(
                 Some(path) => path,
                 None => return Dispatch::Response(super::error_page::build(Some(server), 403)),
             };
-            if index_path.is_file() {
-                return serve_file_or_cgi(server, route, &index_path, remainder, req);
+            match std::fs::metadata(&index_path) {
+                Ok(metadata) if metadata.is_file() => {
+                    return serve_file_or_cgi(server, route, &index_path, remainder, req)
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Dispatch::Response(filesystem_error_response(
+                        server,
+                        "inspect index",
+                        &index_path,
+                        error,
+                    ))
+                }
             }
         }
         if route.autoindex {
-            return Dispatch::Response(autoindex(fs_path, &req.path));
+            return Dispatch::Response(autoindex(server, fs_path, &req.path));
         }
         return Dispatch::Response(super::error_page::build(Some(server), 403));
     }
@@ -264,17 +283,20 @@ pub fn serve_static_file(server: &ServerConfig, path: &Path) -> Response {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             super::error_page::build(Some(server), 403)
         }
-        Err(_) => super::error_page::build(Some(server), 404),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            super::error_page::build(Some(server), 404)
+        }
+        Err(error) => filesystem_error_response(server, "read", path, error),
     }
 }
 
-fn autoindex(dir: &Path, request_path: &str) -> Response {
+fn autoindex(server: &ServerConfig, dir: &Path, request_path: &str) -> Response {
     let mut entries: Vec<String> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .filter_map(|e| e.file_name().into_string().ok())
             .collect(),
-        Err(_) => Vec::new(),
+        Err(error) => return filesystem_error_response(server, "list", dir, error),
     };
     entries.sort();
 
@@ -322,6 +344,28 @@ fn autoindex(dir: &Path, request_path: &str) -> Response {
     );
 
     Response::html(200, body)
+}
+
+fn filesystem_error_response(
+    server: &ServerConfig,
+    operation: &str,
+    path: &Path,
+    error: std::io::Error,
+) -> Response {
+    let status = match error.kind() {
+        std::io::ErrorKind::NotFound => 404,
+        std::io::ErrorKind::PermissionDenied => 403,
+        _ => {
+            eprintln!(
+                "localhost: could not {} {}: {}",
+                operation,
+                path.display(),
+                error
+            );
+            500
+        }
+    };
+    super::error_page::build(Some(server), status)
 }
 
 fn html_escape(s: &str) -> String {
@@ -400,6 +444,54 @@ mod tests {
             Dispatch::Response(resp) => assert_eq!(resp.status, 405),
             _ => panic!("expected a static response"),
         }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn redirect_still_respects_allowed_methods() {
+        let dir = tempdir();
+        let mut server = server_with_root(dir.to_str().unwrap());
+        server.routes[0].redirect = Some((301, "/new".to_string()));
+
+        match dispatch(&server, &req(Method::Post, "/old")) {
+            Dispatch::Response(resp) => {
+                assert_eq!(resp.status, 405);
+                assert!(resp.headers.iter().any(|(name, value)| {
+                    name == "Allow" && value == "GET, HEAD"
+                }));
+            }
+            _ => panic!("expected a method error response"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn filesystem_errors_map_to_specific_statuses() {
+        let dir = tempdir();
+        let server = server_with_root(dir.to_str().unwrap());
+
+        let forbidden = filesystem_error_response(
+            &server,
+            "read",
+            Path::new("private"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let missing = filesystem_error_response(
+            &server,
+            "read",
+            Path::new("missing"),
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        let failed = filesystem_error_response(
+            &server,
+            "read",
+            Path::new("broken"),
+            std::io::Error::from(std::io::ErrorKind::Other),
+        );
+
+        assert_eq!(forbidden.status, 403);
+        assert_eq!(missing.status, 404);
+        assert_eq!(failed.status, 500);
         cleanup(&dir);
     }
 
