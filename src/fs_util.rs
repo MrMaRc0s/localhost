@@ -58,7 +58,12 @@ fn path_is_confined(root: &Path, candidate: &Path) -> bool {
     loop {
         match std::fs::symlink_metadata(existing) {
             Ok(_) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
                 existing = match existing.parent() {
                     Some(parent) => parent,
                     None => return false,
@@ -172,6 +177,19 @@ mod tests {
 
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn accepts_path_info_tail_below_file_inside_root() {
+        let root = tempdir("path-info");
+        std::fs::write(root.join("script.py"), b"print('ok')").unwrap();
+
+        assert_eq!(
+            safe_join(root.to_str().unwrap(), "/script.py/a/b"),
+            Some(root.join("script.py/a/b"))
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn tempdir(label: &str) -> PathBuf {

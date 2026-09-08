@@ -196,12 +196,7 @@ fn resolve_path(
     let meta = match std::fs::metadata(fs_path) {
         Ok(m) => m,
         Err(error) => {
-            return Dispatch::Response(filesystem_error_response(
-                server,
-                "inspect",
-                fs_path,
-                error,
-            ))
+            return Dispatch::Response(filesystem_error_response(server, "inspect", fs_path, error))
         }
     };
 
@@ -353,7 +348,7 @@ fn filesystem_error_response(
     error: std::io::Error,
 ) -> Response {
     let status = match error.kind() {
-        std::io::ErrorKind::NotFound => 404,
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => 404,
         std::io::ErrorKind::PermissionDenied => 403,
         _ => {
             eprintln!(
@@ -456,9 +451,10 @@ mod tests {
         match dispatch(&server, &req(Method::Post, "/old")) {
             Dispatch::Response(resp) => {
                 assert_eq!(resp.status, 405);
-                assert!(resp.headers.iter().any(|(name, value)| {
-                    name == "Allow" && value == "GET, HEAD"
-                }));
+                assert!(resp
+                    .headers
+                    .iter()
+                    .any(|(name, value)| { name == "Allow" && value == "GET, HEAD" }));
             }
             _ => panic!("expected a method error response"),
         }
@@ -482,6 +478,12 @@ mod tests {
             Path::new("missing"),
             std::io::Error::from(std::io::ErrorKind::NotFound),
         );
+        let invalid_tail = filesystem_error_response(
+            &server,
+            "inspect",
+            Path::new("file/child"),
+            std::io::Error::from(std::io::ErrorKind::NotADirectory),
+        );
         let failed = filesystem_error_response(
             &server,
             "read",
@@ -491,6 +493,7 @@ mod tests {
 
         assert_eq!(forbidden.status, 403);
         assert_eq!(missing.status, 404);
+        assert_eq!(invalid_tail.status, 404);
         assert_eq!(failed.status, 500);
         cleanup(&dir);
     }
@@ -567,6 +570,26 @@ mod tests {
 
         cleanup(&dir);
         cleanup(&outside);
+    }
+
+    #[test]
+    fn cgi_request_preserves_path_info_after_script() {
+        let dir = tempdir();
+        std::fs::write(dir.join("hello.py"), b"print('ok')").unwrap();
+        let mut server = server_with_root(dir.to_str().unwrap());
+        server.routes[0]
+            .cgi
+            .insert(".py".to_string(), "/usr/bin/python3".to_string());
+
+        match dispatch(&server, &req(Method::Get, "/hello.py/a/b")) {
+            Dispatch::Cgi(cgi) => {
+                assert_eq!(cgi.script_path, dir.join("hello.py"));
+                assert_eq!(cgi.path_info, "/a/b");
+            }
+            Dispatch::Response(_) => panic!("expected a CGI request"),
+        }
+
+        cleanup(&dir);
     }
 
     fn tempdir() -> PathBuf {
