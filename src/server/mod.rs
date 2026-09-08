@@ -14,6 +14,11 @@ use connection::Connection;
 use epoll::Epoll;
 
 const MAX_EVENTS: usize = 1024;
+/// Keep enough descriptor headroom for listeners, CGI pipes, epoll and
+/// ordinary files under the common 1024-descriptor process limit.
+const MAX_CONNECTIONS: usize = 512;
+const MAX_CGI_PROCESSES: usize = 32;
+const _: () = assert!(MAX_CONNECTIONS + MAX_CGI_PROCESSES * 2 < 1024);
 /// Also doubles as how often we sweep for timed-out connections and
 /// reap finished CGI children, since those are the only other things the
 /// loop needs to do besides react to I/O.
@@ -31,6 +36,28 @@ pub struct EventCtx<'a> {
     pub pipes: &'a mut HashMap<RawFd, RawFd>,
     pub reap: &'a mut Vec<Child>,
     pub sessions: &'a mut SessionStore,
+    pub cgi_slots: &'a mut CgiSlots,
+}
+
+#[derive(Default)]
+pub struct CgiSlots {
+    active: usize,
+}
+
+impl CgiSlots {
+    fn has_capacity(&self) -> bool {
+        self.active < MAX_CGI_PROCESSES
+    }
+
+    fn acquire(&mut self) {
+        if self.has_capacity() {
+            self.active += 1;
+        }
+    }
+
+    fn release(&mut self) {
+        self.active = self.active.saturating_sub(1);
+    }
 }
 
 pub fn run(config: Config) -> std::io::Result<()> {
@@ -49,6 +76,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
     let mut pipes: HashMap<RawFd, RawFd> = HashMap::new();
     let mut reap: Vec<Child> = Vec::new();
     let mut sessions = SessionStore::new();
+    let mut cgi_slots = CgiSlots::default();
 
     loop {
         let events = epoll.wait(MAX_EVENTS, POLL_TIMEOUT_MS)?;
@@ -69,6 +97,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
                     pipes: &mut pipes,
                     reap: &mut reap,
                     sessions: &mut sessions,
+                    cgi_slots: &mut cgi_slots,
                 };
                 match connections.get_mut(&owner_fd) {
                     Some(conn) => guard_panic(owner_fd, || conn.on_event(&config, &mut ctx, ev)),
@@ -83,6 +112,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
                         pipes: &mut pipes,
                         reap: &mut reap,
                         sessions: &mut sessions,
+                        cgi_slots: &mut cgi_slots,
                     };
                     conn.cleanup(&mut ctx);
                 }
@@ -98,6 +128,7 @@ pub fn run(config: Config) -> std::io::Result<()> {
             &mut pipes,
             &mut reap,
             &mut sessions,
+            &mut cgi_slots,
             &mut connections,
         );
     }
@@ -132,6 +163,12 @@ fn accept_one(
     // readable and epoll_wait reports it again on the next loop tick.
     match tcp.accept() {
         Ok((stream, _peer_addr)) => {
+            // Still accept one queued socket when full, then immediately
+            // close it. Leaving it in the accept queue would keep the
+            // listener readable and turn the event loop into a busy spin.
+            if !has_connection_capacity(connections.len()) {
+                return;
+            }
             if let Err(e) = stream.set_nonblocking(true) {
                 eprintln!(
                     "localhost: could not set accepted socket non-blocking: {}",
@@ -160,6 +197,7 @@ fn sweep_timeouts(
     pipes: &mut HashMap<RawFd, RawFd>,
     reap: &mut Vec<Child>,
     sessions: &mut SessionStore,
+    cgi_slots: &mut CgiSlots,
     connections: &mut HashMap<RawFd, Connection>,
 ) {
     let now = Instant::now();
@@ -176,6 +214,7 @@ fn sweep_timeouts(
                 pipes,
                 reap,
                 sessions,
+                cgi_slots,
             };
             match connections.get_mut(&fd) {
                 Some(conn) => guard_panic(fd, || conn.handle_timeout(config, &mut ctx)),
@@ -189,6 +228,7 @@ fn sweep_timeouts(
                     pipes,
                     reap,
                     sessions,
+                    cgi_slots,
                 };
                 conn.cleanup(&mut ctx);
             }
@@ -197,8 +237,36 @@ fn sweep_timeouts(
     }
 }
 
+fn has_connection_capacity(active: usize) -> bool {
+    active < MAX_CONNECTIONS
+}
+
 fn remove_fd(epoll: &Epoll, fd: RawFd) {
     if let Err(e) = epoll.remove(fd) {
         eprintln!("localhost: could not remove fd {} from epoll: {}", fd, e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cgi_slots_stop_at_the_process_limit() {
+        let mut slots = CgiSlots::default();
+        for _ in 0..MAX_CGI_PROCESSES {
+            assert!(slots.has_capacity());
+            slots.acquire();
+        }
+        assert!(!slots.has_capacity());
+
+        slots.release();
+        assert!(slots.has_capacity());
+    }
+
+    #[test]
+    fn connection_capacity_stops_at_the_limit() {
+        assert!(has_connection_capacity(MAX_CONNECTIONS - 1));
+        assert!(!has_connection_capacity(MAX_CONNECTIONS));
     }
 }

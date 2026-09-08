@@ -143,6 +143,7 @@ impl Connection {
                 cgi.kill();
                 let state = std::mem::replace(&mut self.state, State::ReadingHead);
                 if let State::RunningCgi(cgi) = state {
+                    ctx.cgi_slots.release();
                     ctx.reap.push(cgi.into_child());
                 }
                 let resp = crate::error_page::build(None, 504);
@@ -162,6 +163,7 @@ impl Connection {
     pub fn cleanup(&mut self, ctx: &mut EventCtx) {
         ctx.pipes.retain(|_, owner| *owner != self.fd);
         if let State::RunningCgi(mut cgi) = std::mem::replace(&mut self.state, State::ReadingHead) {
+            ctx.cgi_slots.release();
             cgi.kill();
             ctx.reap.push(cgi.into_child());
         }
@@ -339,6 +341,11 @@ impl Connection {
         session_visits: u64,
         ctx: &mut EventCtx,
     ) -> bool {
+        if !ctx.cgi_slots.has_capacity() {
+            let resp = crate::error_page::build(Some(server), 503);
+            return self.begin_write(resp, false, self.pending_for_head, ctx.epoll);
+        }
+
         match cgi::spawn(
             &cgi_req,
             req,
@@ -360,6 +367,7 @@ impl Connection {
                     return self.fail_cgi_setup(process, server, e, ctx);
                 }
                 ctx.pipes.insert(stdout_fd, self.fd);
+                ctx.cgi_slots.acquire();
                 self.state = State::RunningCgi(process);
                 self.state_started = Instant::now();
                 false
@@ -443,6 +451,7 @@ impl Connection {
         };
 
         deregister_cgi(&mut cgi, ctx);
+        ctx.cgi_slots.release();
         cgi.kill();
         ctx.reap.push(cgi.into_child());
 
@@ -463,6 +472,7 @@ impl Connection {
         };
 
         deregister_cgi(&mut cgi, ctx);
+        ctx.cgi_slots.release();
 
         let response = if cgi.output.is_empty() {
             crate::error_page::build(None, 502)
