@@ -9,6 +9,13 @@ pub const COOKIE_NAME: &str = "localhost_session";
 /// swept — without this, a long-running server would accumulate one
 /// entry per visitor forever.
 pub const SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+/// A client that never returns its cookie must not grow the store forever.
+/// This is intentionally a process-wide ceiling because the server itself
+/// is single-process and sessions are not persisted anywhere else.
+const MAX_SESSIONS: usize = 4096;
+/// Evicting a batch amortizes the oldest-session scan during cookie-less
+/// traffic instead of sorting the store for every request beyond the cap.
+const SESSION_EVICTION_BATCH: usize = 256;
 
 pub struct Session {
     pub last_seen: Instant,
@@ -45,6 +52,9 @@ impl SessionStore {
                 return (id.to_string(), false);
             }
         }
+        if self.sessions.len() >= MAX_SESSIONS {
+            self.evict_oldest_batch();
+        }
         let id = generate_id();
         self.sessions.insert(id.clone(), Session::new());
         (id, true)
@@ -64,6 +74,19 @@ impl SessionStore {
     pub fn sweep_expired(&mut self) {
         let now = Instant::now();
         self.sessions.retain(|_, s| now.duration_since(s.last_seen) < SESSION_TTL);
+    }
+
+    fn evict_oldest_batch(&mut self) {
+        let mut by_age: Vec<(String, Instant)> = self
+            .sessions
+            .iter()
+            .map(|(id, session)| (id.clone(), session.last_seen))
+            .collect();
+        by_age.sort_unstable_by_key(|(_, last_seen)| *last_seen);
+
+        for (id, _) in by_age.into_iter().take(SESSION_EVICTION_BATCH) {
+            self.sessions.remove(&id);
+        }
     }
 }
 
@@ -143,5 +166,45 @@ mod tests {
         let a = generate_id();
         let b = generate_id();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn cookie_less_traffic_cannot_grow_store_past_limit() {
+        let mut store = SessionStore::new();
+        let mut newest = String::new();
+        for _ in 0..=MAX_SESSIONS {
+            (newest, _) = store.touch(None);
+        }
+
+        assert!(store.sessions.len() <= MAX_SESSIONS);
+        assert!(store.sessions.contains_key(&newest));
+    }
+
+    #[test]
+    fn capacity_eviction_prefers_old_sessions() {
+        let mut store = SessionStore::new();
+        let old = Instant::now() - Duration::from_secs(60);
+        let recent = Instant::now();
+        for index in 0..SESSION_EVICTION_BATCH {
+            store.sessions.insert(
+                format!("old-{index}"),
+                Session {
+                    last_seen: old,
+                    data: HashMap::new(),
+                },
+            );
+        }
+        store.sessions.insert(
+            "recent".to_string(),
+            Session {
+                last_seen: recent,
+                data: HashMap::new(),
+            },
+        );
+
+        store.evict_oldest_batch();
+
+        assert_eq!(store.sessions.len(), 1);
+        assert!(store.sessions.contains_key("recent"));
     }
 }

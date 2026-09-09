@@ -32,14 +32,19 @@ pub fn dispatch(server: &ServerConfig, req: &Request) -> Dispatch {
         None => return Dispatch::Response(super::error_page::build(Some(server), 404)),
     };
 
-    if let Some((code, target)) = &route.redirect {
-        return Dispatch::Response(Response::redirect(*code, target));
-    }
-
     if !route.allows(req.method) {
-        let allow = route.methods.iter().map(Method::as_str).collect::<Vec<_>>().join(", ");
+        let allow = route
+            .methods
+            .iter()
+            .map(Method::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
         let resp = super::error_page::build(Some(server), 405).header("Allow", allow);
         return Dispatch::Response(resp);
+    }
+
+    if let Some((code, target)) = &route.redirect {
+        return Dispatch::Response(Response::redirect(*code, target));
     }
 
     let base_dir = route.root.as_deref().unwrap_or(&server.root);
@@ -60,7 +65,9 @@ pub fn dispatch(server: &ServerConfig, req: &Request) -> Dispatch {
     // as a real file, so this walks path segments looking for the first
     // one that's an actual file with a configured CGI extension — same
     // traversal guard as safe_join, just applied one prefix at a time.
-    if let Some((interpreter, script_path, path_info)) = find_cgi_script(route, base_dir, &remainder) {
+    if let Some((interpreter, script_path, path_info)) =
+        find_cgi_script(route, base_dir, &remainder)
+    {
         if matches!(req.method, Method::Get | Method::Head | Method::Post) {
             return Dispatch::Cgi(CgiRequest {
                 interpreter,
@@ -88,10 +95,18 @@ pub fn dispatch(server: &ServerConfig, req: &Request) -> Dispatch {
 /// Returns `None` (not a traversal-invalid path, just "no CGI script
 /// found here") the moment a segment either doesn't exist or exists but
 /// isn't a directory to keep descending into.
-fn find_cgi_script(route: &RouteConfig, base_dir: &str, remainder: &str) -> Option<(String, PathBuf, String)> {
+fn find_cgi_script(
+    route: &RouteConfig,
+    base_dir: &str,
+    remainder: &str,
+) -> Option<(String, PathBuf, String)> {
     if route.cgi.is_empty() {
         return None;
     }
+    // Validate the full request path before walking prefixes. For a
+    // PATH_INFO request the tail will not exist, so safe_join checks the
+    // script (the nearest existing ancestor) and catches an escaping link.
+    safe_join(base_dir, remainder)?;
     let segments = sanitize_segments(remainder)?;
 
     let mut candidate = PathBuf::from(base_dir);
@@ -102,7 +117,11 @@ fn find_cgi_script(route: &RouteConfig, base_dir: &str, remainder: &str) -> Opti
         if meta.is_file() {
             let ext = candidate.extension().and_then(|e| e.to_str())?;
             let interpreter = route.cgi.get(&format!(".{}", ext))?;
-            let path_info = if i + 1 < segments.len() { format!("/{}", segments[i + 1..].join("/")) } else { String::new() };
+            let path_info = if i + 1 < segments.len() {
+                format!("/{}", segments[i + 1..].join("/"))
+            } else {
+                String::new()
+            };
             return Some((interpreter.clone(), candidate, path_info));
         }
         // A file that isn't a recognized CGI script ends the search
@@ -128,7 +147,13 @@ fn resolve_delete(server: &ServerConfig, fs_path: &Path) -> Dispatch {
     Dispatch::Response(resp)
 }
 
-fn resolve_upload(server: &ServerConfig, route: &RouteConfig, base_dir: &str, remainder: &str, req: &Request) -> Dispatch {
+fn resolve_upload(
+    server: &ServerConfig,
+    route: &RouteConfig,
+    base_dir: &str,
+    remainder: &str,
+    req: &Request,
+) -> Dispatch {
     let store_dir = route.upload_store.as_deref().unwrap_or(base_dir);
     let resp = match crate::upload::save(store_dir, remainder, req) {
         Ok(saved) => {
@@ -138,7 +163,12 @@ fn resolve_upload(server: &ServerConfig, route: &RouteConfig, base_dir: &str, re
         }
         Err(reason) => {
             eprintln!("localhost: upload to {} failed: {}", store_dir, reason);
-            super::error_page::build(Some(server), 400)
+            let status = match reason {
+                crate::upload::UploadError::BadRequest(_) => 400,
+                crate::upload::UploadError::Forbidden(_) => 403,
+                crate::upload::UploadError::Io(_) => 500,
+            };
+            super::error_page::build(Some(server), status)
         }
     };
     Dispatch::Response(resp)
@@ -150,25 +180,51 @@ fn strip_route_prefix(route_path: &str, request_path: &str) -> String {
     if route_path == "/" {
         return request_path.to_string();
     }
-    request_path.strip_prefix(route_path).unwrap_or("").to_string()
+    request_path
+        .strip_prefix(route_path)
+        .unwrap_or("")
+        .to_string()
 }
 
-fn resolve_path(server: &ServerConfig, route: &RouteConfig, fs_path: &Path, remainder: &str, req: &Request) -> Dispatch {
+fn resolve_path(
+    server: &ServerConfig,
+    route: &RouteConfig,
+    fs_path: &Path,
+    remainder: &str,
+    req: &Request,
+) -> Dispatch {
     let meta = match std::fs::metadata(fs_path) {
         Ok(m) => m,
-        Err(_) => return Dispatch::Response(super::error_page::build(Some(server), 404)),
+        Err(error) => {
+            return Dispatch::Response(filesystem_error_response(server, "inspect", fs_path, error))
+        }
     };
 
     if meta.is_dir() {
         let index_name = route.index.as_deref().or(server.index.as_deref());
         if let Some(index_name) = index_name {
-            let index_path = fs_path.join(index_name);
-            if index_path.is_file() {
-                return serve_file_or_cgi(server, route, &index_path, remainder, req);
+            let index_path = match safe_join(fs_path.to_str().unwrap_or(""), index_name) {
+                Some(path) => path,
+                None => return Dispatch::Response(super::error_page::build(Some(server), 403)),
+            };
+            match std::fs::metadata(&index_path) {
+                Ok(metadata) if metadata.is_file() => {
+                    return serve_file_or_cgi(server, route, &index_path, remainder, req)
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Dispatch::Response(filesystem_error_response(
+                        server,
+                        "inspect index",
+                        &index_path,
+                        error,
+                    ))
+                }
             }
         }
         if route.autoindex {
-            return Dispatch::Response(autoindex(fs_path, &req.path));
+            return Dispatch::Response(autoindex(server, fs_path, &req.path));
         }
         return Dispatch::Response(super::error_page::build(Some(server), 403));
     }
@@ -176,7 +232,13 @@ fn resolve_path(server: &ServerConfig, route: &RouteConfig, fs_path: &Path, rema
     serve_file_or_cgi(server, route, fs_path, remainder, req)
 }
 
-fn serve_file_or_cgi(server: &ServerConfig, route: &RouteConfig, file_path: &Path, remainder: &str, req: &Request) -> Dispatch {
+fn serve_file_or_cgi(
+    server: &ServerConfig,
+    route: &RouteConfig,
+    file_path: &Path,
+    remainder: &str,
+    req: &Request,
+) -> Dispatch {
     if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
         let dotted = format!(".{}", ext);
         if let Some(interpreter) = route.cgi.get(&dotted) {
@@ -210,20 +272,34 @@ fn path_info_after_script(file_path: &Path, remainder: &str) -> String {
 
 pub fn serve_static_file(server: &ServerConfig, path: &Path) -> Response {
     match std::fs::read(path) {
-        Ok(contents) => Response::new(200).header("Content-Type", content_type_for(path)).body(contents),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => super::error_page::build(Some(server), 403),
-        Err(_) => super::error_page::build(Some(server), 404),
+        Ok(contents) => Response::new(200)
+            .header("Content-Type", content_type_for(path))
+            .body(contents),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            super::error_page::build(Some(server), 403)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            super::error_page::build(Some(server), 404)
+        }
+        Err(error) => filesystem_error_response(server, "read", path, error),
     }
 }
 
-fn autoindex(dir: &Path, request_path: &str) -> Response {
+fn autoindex(server: &ServerConfig, dir: &Path, request_path: &str) -> Response {
     let mut entries: Vec<String> = match std::fs::read_dir(dir) {
-        Ok(rd) => rd.filter_map(|e| e.ok()).filter_map(|e| e.file_name().into_string().ok()).collect(),
-        Err(_) => Vec::new(),
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect(),
+        Err(error) => return filesystem_error_response(server, "list", dir, error),
     };
     entries.sort();
 
-    let base = if request_path.ends_with('/') { request_path.to_string() } else { format!("{}/", request_path) };
+    let base = if request_path.ends_with('/') {
+        request_path.to_string()
+    } else {
+        format!("{}/", request_path)
+    };
 
     let mut rows = String::new();
     if request_path != "/" {
@@ -265,8 +341,33 @@ fn autoindex(dir: &Path, request_path: &str) -> Response {
     Response::html(200, body)
 }
 
+fn filesystem_error_response(
+    server: &ServerConfig,
+    operation: &str,
+    path: &Path,
+    error: std::io::Error,
+) -> Response {
+    let status = match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => 404,
+        std::io::ErrorKind::PermissionDenied => 403,
+        _ => {
+            eprintln!(
+                "localhost: could not {} {}: {}",
+                operation,
+                path.display(),
+                error
+            );
+            500
+        }
+    };
+    super::error_page::build(Some(server), status)
+}
+
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 #[cfg(test)]
@@ -274,6 +375,7 @@ mod tests {
     use super::*;
     use crate::config::RouteConfig;
     use std::collections::HashMap;
+    use std::os::unix::fs::symlink;
 
     fn server_with_root(root: &str) -> ServerConfig {
         ServerConfig {
@@ -341,6 +443,62 @@ mod tests {
     }
 
     #[test]
+    fn redirect_still_respects_allowed_methods() {
+        let dir = tempdir();
+        let mut server = server_with_root(dir.to_str().unwrap());
+        server.routes[0].redirect = Some((301, "/new".to_string()));
+
+        match dispatch(&server, &req(Method::Post, "/old")) {
+            Dispatch::Response(resp) => {
+                assert_eq!(resp.status, 405);
+                assert!(resp
+                    .headers
+                    .iter()
+                    .any(|(name, value)| { name == "Allow" && value == "GET, HEAD" }));
+            }
+            _ => panic!("expected a method error response"),
+        }
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn filesystem_errors_map_to_specific_statuses() {
+        let dir = tempdir();
+        let server = server_with_root(dir.to_str().unwrap());
+
+        let forbidden = filesystem_error_response(
+            &server,
+            "read",
+            Path::new("private"),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        let missing = filesystem_error_response(
+            &server,
+            "read",
+            Path::new("missing"),
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        let invalid_tail = filesystem_error_response(
+            &server,
+            "inspect",
+            Path::new("file/child"),
+            std::io::Error::from(std::io::ErrorKind::NotADirectory),
+        );
+        let failed = filesystem_error_response(
+            &server,
+            "read",
+            Path::new("broken"),
+            std::io::Error::from(std::io::ErrorKind::Other),
+        );
+
+        assert_eq!(forbidden.status, 403);
+        assert_eq!(missing.status, 404);
+        assert_eq!(invalid_tail.status, 404);
+        assert_eq!(failed.status, 500);
+        cleanup(&dir);
+    }
+
+    #[test]
     fn traversal_outside_root_is_rejected() {
         let dir = tempdir();
         let server = server_with_root(dir.to_str().unwrap());
@@ -351,11 +509,98 @@ mod tests {
         cleanup(&dir);
     }
 
+    #[test]
+    fn symlink_outside_root_is_rejected_for_get() {
+        let dir = tempdir();
+        let outside = tempdir();
+        let file = outside.join("secret.txt");
+        std::fs::write(&file, b"outside").unwrap();
+        symlink(&file, dir.join("escape.txt")).unwrap();
+        let server = server_with_root(dir.to_str().unwrap());
+
+        match dispatch(&server, &req(Method::Get, "/escape.txt")) {
+            Dispatch::Response(resp) => assert_eq!(resp.status, 403),
+            _ => panic!("expected a static response"),
+        }
+
+        cleanup(&dir);
+        cleanup(&outside);
+    }
+
+    #[test]
+    fn symlink_outside_root_is_rejected_for_delete() {
+        let dir = tempdir();
+        let outside = tempdir();
+        let file = outside.join("keep.txt");
+        std::fs::write(&file, b"outside").unwrap();
+        symlink(&file, dir.join("escape.txt")).unwrap();
+        let mut server = server_with_root(dir.to_str().unwrap());
+        server.routes[0].methods.push(Method::Delete);
+
+        match dispatch(&server, &req(Method::Delete, "/escape.txt")) {
+            Dispatch::Response(resp) => assert_eq!(resp.status, 403),
+            _ => panic!("expected a static response"),
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), b"outside");
+
+        cleanup(&dir);
+        cleanup(&outside);
+    }
+
+    #[test]
+    fn symlinked_cgi_outside_root_is_not_executed() {
+        let dir = tempdir();
+        let outside = tempdir();
+        let script = outside.join("escape.py");
+        std::fs::write(
+            &script,
+            b"print('Content-Type: text/plain\\r\\n\\r\\noutside')",
+        )
+        .unwrap();
+        symlink(&script, dir.join("escape.py")).unwrap();
+        let mut server = server_with_root(dir.to_str().unwrap());
+        server.routes[0]
+            .cgi
+            .insert(".py".to_string(), "/usr/bin/python3".to_string());
+
+        match dispatch(&server, &req(Method::Get, "/escape.py/path-info")) {
+            Dispatch::Response(resp) => assert_eq!(resp.status, 403),
+            Dispatch::Cgi(_) => panic!("escaping CGI symlink must not be executed"),
+        }
+
+        cleanup(&dir);
+        cleanup(&outside);
+    }
+
+    #[test]
+    fn cgi_request_preserves_path_info_after_script() {
+        let dir = tempdir();
+        std::fs::write(dir.join("hello.py"), b"print('ok')").unwrap();
+        let mut server = server_with_root(dir.to_str().unwrap());
+        server.routes[0]
+            .cgi
+            .insert(".py".to_string(), "/usr/bin/python3".to_string());
+
+        match dispatch(&server, &req(Method::Get, "/hello.py/a/b")) {
+            Dispatch::Cgi(cgi) => {
+                assert_eq!(cgi.script_path, dir.join("hello.py"));
+                assert_eq!(cgi.path_info, "/a/b");
+            }
+            Dispatch::Response(_) => panic!("expected a CGI request"),
+        }
+
+        cleanup(&dir);
+    }
+
     fn tempdir() -> PathBuf {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("localhost-router-test-{}-{}", std::process::id(), id));
+        let dir = std::env::temp_dir().join(format!(
+            "localhost-router-test-{}-{}",
+            std::process::id(),
+            id
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
